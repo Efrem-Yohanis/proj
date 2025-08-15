@@ -12,6 +12,7 @@ from flow_builder_app.node.models import (
 )
 from flow_builder_app.parameter.models import Parameter,ParameterValue
 
+
 class NodeFamilySerializer(serializers.ModelSerializer):
     """
     Serializer for NodeFamily with version information
@@ -85,6 +86,7 @@ class NodeFamilySerializer(serializers.ModelSerializer):
             for child in obj.child_nodes.all()
         ]
     
+
 class NodeVersionLinkSerializer(serializers.ModelSerializer):
     """
     Serializer for version-to-version relationships

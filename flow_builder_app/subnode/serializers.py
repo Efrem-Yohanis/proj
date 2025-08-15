@@ -3,7 +3,7 @@ from django.db.models import Q
 from rest_framework import serializers
 from flow_builder_app.subnode.models import SubNode
 from flow_builder_app.parameter.models import ParameterValue
-from flow_builder_app.node.models import NodeFamily  # Import the related model
+from flow_builder_app.node.models import NodeFamily,NodeVersion  # Import the related model
 
 # ---------- SubNode Version Serializer ----------
 
@@ -44,6 +44,8 @@ class SubNodeSerializer(serializers.ModelSerializer):
     updated_by = serializers.SerializerMethodField()
     node_family = serializers.SerializerMethodField()
     all_version_parameters = serializers.SerializerMethodField()
+    family_name = serializers.CharField(source='node_family.name', read_only=True)
+    family_id = serializers.UUIDField(source='node_family.id', read_only=True)
     
     class Meta:
         model = SubNode
@@ -100,7 +102,26 @@ class SubNodeSerializer(serializers.ModelSerializer):
 
 
 # ---------- Parameter Value Update Serializer ----------
+class VersionSerializer(serializers.ModelSerializer):
+    subnodes = serializers.SerializerMethodField()
 
+    class Meta:
+        model = NodeVersion
+        fields = [
+            'id',
+            'version',
+            'state',
+            'changelog',
+            'script_url',
+            'subnodes',
+            'created_at',
+            'created_by',
+        ]
+
+    def get_subnodes(self, obj):
+        # Filter subnodes for THIS version only
+        subnodes_qs = SubNode.objects.filter(node_family=obj.family, version=obj.version)
+        return SubNodeSerializer(subnodes_qs, many=True).data
 class ParameterValueUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = ParameterValue

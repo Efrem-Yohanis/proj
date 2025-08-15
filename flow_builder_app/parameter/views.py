@@ -10,6 +10,12 @@ from rest_framework.decorators import action
 from rest_framework.parsers import JSONParser
 from .models import Parameter, ParameterValue
 from .serializers import ParameterSerializer, ParameterValueSerializer
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
+from django.utils import timezone
+import json
+from django.utils.timezone import now
+
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +24,22 @@ class ParameterViewSet(viewsets.ModelViewSet):
     queryset = Parameter.objects.all()
     serializer_class = ParameterSerializer
     permission_classes = [AllowAny]
+  
+    def list(self, request, *args, **kwargs):
+        queryset = self.get_queryset()
+        serializer = self.get_serializer(queryset, many=True)
 
+        total_count = queryset.count()
+        active_count = queryset.filter(is_active=True).count()
+        draft_count = queryset.filter(is_active=False).count()
+
+        return Response({
+            "total": total_count,
+            "published": active_count,
+            "draft": draft_count,
+            "results": serializer.data
+        })
+    
     def get_permissions(self):
         # Allow any user to access deploy/undeploy/clone/import endpoints
         if self.action in ['deploy', 'undeploy', 'clone', 'import_json']:
@@ -109,18 +130,67 @@ class ParameterViewSet(viewsets.ModelViewSet):
         response['Content-Disposition'] = f'attachment; filename=parameter_{param.id}.json'
         return response
 
-    @action(detail=False, methods=['post'], parser_classes=[JSONParser])
+    @action(
+        detail=False,
+        methods=['post'],
+        parser_classes=[JSONParser, MultiPartParser, FormParser]
+    )
     def import_json(self, request):
-        content_type = request.content_type or ''
-        if not content_type.startswith('application/json'):
-            return Response(
-                {"detail": "Unsupported Media Type. Use application/json."},
-                status=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
-            )
-        serializer = self.get_serializer(data=request.data)
+        logger.info("HIT Parameter import_json")
+
+        # 1️⃣ Parse the incoming data
+        data = None
+
+        # Case 1: File upload
+        if 'file' in request.FILES:
+            file_obj = request.FILES['file']
+            try:
+                data = json.load(file_obj)
+            except Exception as e:
+                return Response({"error": f"Invalid JSON file: {str(e)}"},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+        # Case 2: Direct JSON body
+        elif isinstance(request.data, dict):
+            data = request.data
+        else:
+            return Response({"error": "No JSON data or file provided"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        logger.debug(f"Parsed import data: {data}")
+
+        # 2️⃣ Extract and validate fields
+        key = data.get('key')
+        default_value = data.get('default_value', "")
+        datatype = data.get('datatype')
+
+        if not key or not datatype:
+            return Response({"error": "key and datatype are required"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if Parameter.objects.filter(key=key).exists():
+            return Response({"error": f"Parameter with key '{key}' already exists"},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # 3️⃣ Prepare create payload
+        create_payload = {
+            "key": key,
+            "default_value": default_value,
+            "datatype": datatype,
+            "is_active": False,  # force false
+            "created_at": now(),
+            "created_by": None
+        }
+
+        logger.debug(f"Creating Parameter with: {create_payload}")
+
+        # 4️⃣ Create parameter
+        serializer = self.get_serializer(data=create_payload)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        param = serializer.save()
+
+        return Response(self.get_serializer(param).data,
+                        status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'])
     def clone(self, request, pk=None):
