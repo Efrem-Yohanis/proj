@@ -14,7 +14,7 @@ from django.db import transaction
 from flow_builder_app.subnode.models import SubNodeParameterValue
 from .models import SubNode
 from flow_builder_app.parameter.models import ParameterValue,Parameter
-from flow_builder_app.node.models import NodeFamily
+from flow_builder_app.node.models import NodeFamily, NodeVersion  # { added NodeVersion }
 from .serializers import SubNodeSerializer, ParameterValueUpdateSerializer, SubNodeCreateSerializer
 
 logger = logging.getLogger(__name__)
@@ -127,50 +127,55 @@ class SubNodeViewSet(viewsets.ModelViewSet):
     def retrieve(self, request, *args, **kwargs):
         subnode = self.get_object()
         original_ref = self._get_original(subnode)
-        
-        # Get all versions of this SubNode
-        versions_qs = SubNode.objects.filter(
+
+        # --- get subnode-version entries (these are the SubNode model versions) ---
+        subnode_versions_qs = SubNode.objects.filter(
             Q(original=original_ref) | Q(id=original_ref.id)
         ).order_by('version')
-        
-        # Get active version if exists
-        active_version_obj = versions_qs.filter(is_deployed=True).order_by('-version').first()
-        active_version_num = active_version_obj.version if active_version_obj else None
-        original_version_num = versions_qs.first().version if versions_qs.exists() else None
 
-        # Prefetch all parameters for the node family to optimize queries
-        node_family_parameters = Parameter.objects.filter(
-            node_parameters__node_version__family=subnode.node_family
-        ).distinct().prefetch_related('node_parameters')
+        # --- get all NodeVersions for the family (these are the node-version axes) ---
+        from flow_builder_app.node.models import NodeVersion
+        node_versions = NodeVersion.objects.filter(family=subnode.node_family).order_by('version')
+
+        # active/original info derived from SubNode versions (unchanged)
+        active_version_obj = subnode_versions_qs.filter(is_deployed=True).order_by('-version').first()
+        active_version_num = active_version_obj.version if active_version_obj else None
+        original_version_num = subnode_versions_qs.first().version if subnode_versions_qs.exists() else None
 
         versions_list = []
-        for version in versions_qs:
-            # Get explicitly set parameter values for this version
-            param_values_qs = ParameterValue.objects.filter(subnode=version).select_related('parameter')
-            explicit_params = {pv.parameter.key: pv.value for pv in param_values_qs}
-            
-            # Build complete parameter list including inherited defaults
-            all_parameters = []
-            for param in node_family_parameters:
-                # Check if this parameter exists in any version of the node family
-                param_data = {
-                    "parameter_key": param.key,
-                    "value": explicit_params.get(param.key, param.default_value),
-                    "default_value": param.default_value,
-                    "datatype": param.datatype,
-                    "source": "subnode" if param.key in explicit_params else "default"
-                }
-                all_parameters.append(param_data)
+        for sn_version in subnode_versions_qs:
+            # For this subnode-version, build parameter values for every node-version
+            nodeversion_values = []
+            for nv in node_versions:
+                node_params = nv.parameters.select_related('parameter').all()
+                params_for_nv = []
+                for np in node_params:
+                    p = np.parameter
+                    # Use NodeParameter.value (version-level). If null, fall back to parameter.default_value
+                    value = np.value if np.value is not None else getattr(p, 'default_value', None)
+                    params_for_nv.append({
+                        "parameter_key": p.key,
+                        "value": value,
+                        "default_value": getattr(p, 'default_value', None),
+                        "datatype": getattr(p, 'datatype', None),
+                        "source": "version"
+                    })
+
+                nodeversion_values.append({
+                    "node_version": nv.version,
+                    "parameter_values": params_for_nv
+                })
 
             versions_list.append({
-                "id": str(version.id),
-                "version": version.version,
-                "is_deployed": version.is_deployed,
-                "is_editable": version.is_editable,
-                "updated_at": version.updated_at.isoformat() if version.updated_at else None,
-                "updated_by": getattr(version, 'updated_by', '') or "",
-                "version_comment": version.version_comment or "",
-                "parameter_values": all_parameters  # Now includes all parameters
+                "id": str(sn_version.id),
+                "version": sn_version.version,
+                "is_deployed": sn_version.is_deployed,
+                "is_editable": sn_version.is_editable,
+                "updated_at": sn_version.updated_at.isoformat() if sn_version.updated_at else None,
+                "updated_by": getattr(sn_version, 'updated_by', '') or "",
+                "version_comment": sn_version.version_comment or "",
+                # New: parameter values grouped by node-version
+                "parameter_values_by_nodeversion": nodeversion_values
             })
 
         response_data = {
@@ -321,7 +326,7 @@ class SubNodeViewSet(viewsets.ModelViewSet):
             originals[orig_id] = sn.original or sn
             grouped[orig_id].append(sn)
 
-        response = []
+        response_list = []
         for orig_id, versions in grouped.items():
             original = originals[orig_id]
             versions_sorted = sorted(versions, key=lambda v: v.version)
@@ -354,7 +359,7 @@ class SubNodeViewSet(viewsets.ModelViewSet):
                     "parameter_values": param_values,
                 })
 
-            response.append({
+            response_list.append({
                 "id": str(original.id),
                 "name": original.name,
                 "description": original.description or "",
@@ -366,60 +371,91 @@ class SubNodeViewSet(viewsets.ModelViewSet):
                 "versions": versions_list,
             })
 
-        return Response(response)
+        # totals
+        total_count = len(response_list)
+        published_count = sum(1 for item in response_list if item.get('active_version') is not None)
+        draft_count = total_count - published_count
+
+        wrapped = {
+            "total": total_count,
+            "published": published_count,
+            "draft": draft_count,
+            "results": response_list
+        }
+
+        return Response(wrapped)
 
     @action(detail=True, methods=['patch'], url_path='update_parameter_values', url_name='update-parameter-values')
     def update_parameter_values(self, request, *args, **kwargs):
-            subnode = self.get_object()
-            param_updates = request.data.get('parameter_values', [])
-            # optional: specific node version to sync (integer)
-            target_version = request.data.get('version') or request.query_params.get('version')
-            if target_version is not None:
-                try:
-                    target_version = int(target_version)
-                except (ValueError, TypeError):
-                    return Response({"error": "Invalid 'version' value"}, status=status.HTTP_400_BAD_REQUEST)
+        subnode = self.get_object()
+        param_updates = request.data.get('parameter_values', [])
+        # optional: specific node version to sync (integer)
+        target_version = request.data.get('version') or request.query_params.get('version')
+        if target_version is not None:
+            try:
+                target_version = int(target_version)
+            except (ValueError, TypeError):
+                return Response({"error": "Invalid 'version' value"}, status=status.HTTP_400_BAD_REQUEST)
 
-            updated, errors = [], []
+        updated, errors = [], []
 
-            for item in param_updates:
-                param_id = item.get('id')
-                new_value = item.get('value')
+        for item in param_updates:
+            param_id = item.get('id')
+            new_value = item.get('value')
 
-                if not param_id or new_value is None:
-                    errors.append({"id": param_id, "error": "Both 'id' and 'value' are required"})
-                    continue
+            if not param_id or new_value is None:
+                errors.append({"id": param_id, "error": "Both 'id' and 'value' are required"})
+                continue
 
-                obj = (
-                    ParameterValue.objects.filter(id=param_id, subnode=subnode).first()
-                    or SubNodeParameterValue.objects.filter(id=param_id, subnode=subnode).first()
-                )
-
-                if obj:
-                    obj.value = new_value
-                    obj.save(update_fields=["value"])
-
-                    # Sync NodeParameter values for this parameter to a specific version if requested
-                    try:
-                        from flow_builder_app.node.models import NodeParameter
-                        filters = {
-                            "node_version__family": subnode.node_family,
-                            "parameter": obj.parameter
-                        }
-                        if target_version is not None:
-                            filters["node_version__version"] = target_version
-                        NodeParameter.objects.filter(**filters).update(value=new_value)
-                    except Exception:
-                        logger.exception("Failed to sync NodeParameter for parameter %s", getattr(obj.parameter, 'id', None))
-
-                    updated.append({"id": str(obj.id), "value": obj.value})
-                else:
-                    errors.append({"id": param_id, "error": "Not found for this subnode"})
-
-            return Response(
-                {"updated": updated, "errors": errors},
-                status=status.HTTP_200_OK if updated else status.HTTP_400_BAD_REQUEST
+            obj = (
+                ParameterValue.objects.filter(id=param_id, subnode=subnode).first()
+                or SubNodeParameterValue.objects.filter(id=param_id, subnode=subnode).first()
             )
+
+            if obj:
+                obj.value = new_value
+                obj.save(update_fields=["value"])
+
+                # Sync NodeParameter values for this parameter.
+                try:
+                    # Local imports to avoid circular dependencies
+                    from flow_builder_app.node.models import NodeParameter, NodeVersion
+
+                    if target_version is not None:
+                        # Find the target NodeVersion in this family
+                        try:
+                            target_nv = NodeVersion.objects.get(family=subnode.node_family, version=target_version)
+                        except NodeVersion.DoesNotExist:
+                            errors.append({"id": param_id, "error": f"Target version {target_version} not found"})
+                            continue
+
+                        # Update existing NodeParameter or create one for that version
+                        np_qs = NodeParameter.objects.filter(node_version=target_nv, parameter=obj.parameter)
+                        if np_qs.exists():
+                            np_qs.update(value=new_value)
+                        else:
+                            NodeParameter.objects.create(
+                                node_version=target_nv,
+                                parameter=obj.parameter,
+                                value=new_value
+                            )
+                    else:
+                        # Update all NodeParameter rows in the family (existing behavior)
+                        NodeParameter.objects.filter(
+                            node_version__family=subnode.node_family,
+                            parameter=obj.parameter
+                        ).update(value=new_value)
+                except Exception:
+                    logger.exception("Failed to sync NodeParameter for parameter %s", getattr(obj.parameter, 'id', None))
+
+                updated.append({"id": str(obj.id), "value": obj.value})
+            else:
+                errors.append({"id": param_id, "error": "Not found for this subnode"})
+
+        return Response(
+            {"updated": updated, "errors": errors},
+            status=status.HTTP_200_OK if updated else status.HTTP_400_BAD_REQUEST
+        )
     @action(detail=True, methods=['get'], url_path='export')
     def export(self, request, **kwargs):
         subnode = self.get_object()

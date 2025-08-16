@@ -292,15 +292,36 @@ class VersionViewSet(viewsets.GenericViewSet,
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            # Require at least one active (published) version to create a new version
+            version_count = family.versions.count()
+            max_version = family.versions.aggregate(Max('version'))['version__max'] or 0
+
+            # If no versions exist for the family, allow creating the initial version (v1)
+            if version_count == 0:
+                new_version = NodeVersion.objects.create(
+                    family=family,
+                    version=1,
+                    state='draft',
+                    changelog=serializer.validated_data.get('changelog', ''),
+                    created_by=request.user.username
+                )
+                # No source to copy from (initial creation)
+                return Response(
+                    NodeVersionSerializer(new_version, context={'request': request}).data,
+                    status=status.HTTP_201_CREATED
+                )
+
+            # For families with existing versions, require an active published version
             active_version = family.versions.filter(state='published').order_by('-version').first()
-            if not active_version:
+            source_version_num = serializer.validated_data.get('source_version')
+
+            # If no active published version and no explicit source provided -> error
+            if not active_version and source_version_num is None:
                 return Response(
                     {"error": "Cannot create a new version when there is no active (published) version for this family."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            max_version = family.versions.aggregate(Max('version'))['version__max'] or 0
+            # Create new version number
             new_version = NodeVersion.objects.create(
                 family=family,
                 version=max_version + 1,
@@ -309,13 +330,13 @@ class VersionViewSet(viewsets.GenericViewSet,
                 created_by=request.user.username
             )
 
-            # Choose source: explicit source_version if provided, else use the active published version
-            source_version_num = serializer.validated_data.get('source_version') or active_version.version
-            if source_version_num is not None:
+            # Choose source: explicit source_version if provided, else active published version
+            chosen_source_num = source_version_num or (active_version.version if active_version else None)
+            if chosen_source_num is not None:
                 source = get_object_or_404(
                     NodeVersion,
                     family=family,
-                    version=source_version_num
+                    version=chosen_source_num
                 )
                 # Copy script from source
                 new_version.script = source.script
@@ -329,15 +350,21 @@ class VersionViewSet(viewsets.GenericViewSet,
                     )
                     for np in source.parameters.select_related('parameter').all()
                 ])
-                # Copy subnode links in bulk from the chosen source
-                NodeVersionLink.objects.bulk_create([
-                    NodeVersionLink(
+                # Copy subnode links in bulk from the chosen source, deduplicate to avoid UNIQUE constraint
+                seen_child_ids = set()
+                link_objs = []
+                for link in source.child_links.all():
+                    child_id = getattr(link.child_version, 'id', None) or link.child_version_id
+                    if child_id in seen_child_ids:
+                        continue
+                    seen_child_ids.add(child_id)
+                    link_objs.append(NodeVersionLink(
                         parent_version=new_version,
                         child_version=link.child_version,
                         order=link.order
-                    )
-                    for link in source.child_links.all()
-                ])
+                    ))
+                if link_objs:
+                    NodeVersionLink.objects.bulk_create(link_objs, ignore_conflicts=True)
 
             return Response(
                 NodeVersionSerializer(new_version, context={'request': request}).data,
@@ -544,21 +571,36 @@ class VersionContentViewSet(viewsets.GenericViewSet):
 
     @action(detail=True, methods=['PATCH'], parser_classes=[MultiPartParser])
     def script(self, request, family_id=None, version=None):
-        """Update the version's script file"""
+        """Update the version's script file — accepts uploaded file 'script' or text 'script_text'"""
         node_version = self.get_object()
-        
+
         if node_version.state == 'published':
             return Response(
-                {"error": "Cannot modify published versions"}, 
+                {"error": "Cannot modify published versions"},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        serializer = ScriptUpdateSerializer(data=request.data)
+
+        # Validate input (do not pass 'files' kwarg to serializer)
+        serializer = ScriptUpdateSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
-        
-        node_version.script = serializer.validated_data['script']
-        node_version.save()
-        
+
+        # If a file was uploaded, use it; otherwise use script_text
+        if 'script' in request.FILES:
+            uploaded = request.FILES['script']
+            # Save uploaded file to model FileField
+            node_version.script.save(uploaded.name, uploaded, save=True)
+        else:
+            script_text = serializer.validated_data.get('script_text')
+            if script_text is None:
+                return Response(
+                    {"error": "No script provided. Send multipart file 'script' or JSON 'script_text'."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            # Save text as a .py file
+            from django.core.files.base import ContentFile
+            filename = f"version_{node_version.version}_script.py"
+            node_version.script.save(filename, ContentFile(script_text.encode('utf-8')), save=True)
+
         return Response(
             {
                 "status": "Script updated successfully",
@@ -809,6 +851,62 @@ class VersionContentViewSet(viewsets.GenericViewSet):
             {"script_url": request.build_absolute_uri(node_version.script.url)},
             status=status.HTTP_200_OK
         )
+    
+    @action(detail=True, methods=['PATCH'], url_path='parameters')
+    def update_parameters(self, request, family_id=None, version=None):
+        """
+        PATCH /api/node-families/<family_id>/versions/<version>/parameters/
+        Body: {"parameters": [{"parameter_id": "<uuid>", "value": "..."} , ...]}
+        Updates NodeParameter rows for this specific NodeVersion only (no changes to other versions).
+        """
+        node_version = self.get_object()
+
+        # Prevent editing published versions if desired
+        if node_version.state == 'published':
+            return Response({"error": "Cannot modify published versions"}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = request.data.get('parameters')
+        if not isinstance(payload, list):
+            return Response({"error": "Field 'parameters' must be a list"}, status=status.HTTP_400_BAD_REQUEST)
+
+        updated = []
+        created = []
+        errors = []
+
+        for item in payload:
+            pid = item.get('parameter_id') or item.get('id')
+            value = item.get('value')
+            if not pid:
+                errors.append({"item": item, "error": "missing parameter_id"})
+                continue
+
+            try:
+                # Try update existing NodeParameter for this version
+                np = NodeParameter.objects.filter(node_version=node_version, parameter_id=pid).first()
+                if np:
+                    np.value = value
+                    np.save(update_fields=['value'])
+                    updated.append(str(np.parameter_id))
+                else:
+                    # create NodeParameter for this version (keeps other versions unchanged)
+                    np = NodeParameter.objects.create(
+                        node_version=node_version,
+                        parameter_id=pid,
+                        value=value
+                    )
+                    created.append(str(np.parameter_id))
+            # Keep things resilient: log and collect per-item errors
+            except Exception as e:
+                logger.exception("Failed to update parameter %s for version %s", pid, node_version.id)
+                errors.append({"parameter_id": pid, "error": str(e)})
+
+        return Response({
+            "version": node_version.version,
+            "updated_parameter_ids": updated,
+            "created_parameter_ids": created,
+            "errors": errors,
+            "version_data": NodeVersionSerializer(node_version, context={'request': request}).data
+        }, status=status.HTTP_200_OK)
 class DeploymentViewSet(viewsets.GenericViewSet):
     """
     ViewSet for handling version deployment operations
@@ -956,3 +1054,8 @@ class DeploymentViewSet(viewsets.GenericViewSet):
         }
         
         return Response(data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['POST'], url_path='add_paramtery')
+    def add_paramtery(self, request, family_id=None, version=None):
+        """Alias for add_parameter to accept common misspelling of the URL."""
+        return self.add_parameter(request, family_id=family_id, version=version)

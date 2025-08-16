@@ -380,30 +380,52 @@ class ParameterUpdateSerializer(serializers.Serializer):
 class ScriptUpdateSerializer(serializers.Serializer):
     """
     Serializer for updating node script files
+    Accepts either a FileField named 'script' or a text field 'script_text'.
     """
     MAX_SIZE = 5 * 1024 * 1024  # 5MB
-    script = serializers.FileField(required=True)
+    script = serializers.FileField(required=False)
+    script_text = serializers.CharField(required=False, allow_blank=False)
 
-    def validate_script(self, value) -> Any:
-        """Validate script file properties"""
-        if value.size > self.MAX_SIZE:
-            raise serializers.ValidationError(
-                f"Script too large. Max size is {self.MAX_SIZE/1024/1024}MB"
-            )
-            
-        name = getattr(value, "name", "")
-        if not name.lower().endswith(".py"):
-            raise serializers.ValidationError("Only Python (.py) files allowed")
-            
-        # Optional: Add basic Python syntax validation
-        try:
-            content = value.read().decode('utf-8')
-            compile(content, name, 'exec')
-            value.seek(0)  # Reset file pointer
-        except SyntaxError as e:
-            raise serializers.ValidationError(f"Invalid Python syntax: {str(e)}")
-            
-        return value
+    def validate(self, attrs) -> Any:
+        # Validate that at least one input is provided
+        script_file = attrs.get('script')
+        script_text = attrs.get('script_text')
+
+        if not script_file and not script_text:
+            raise serializers.ValidationError("Provide either 'script' (file) or 'script_text' (string).")
+
+        # If file provided, validate file properties and python syntax
+        if script_file:
+            if hasattr(script_file, 'size') and script_file.size > self.MAX_SIZE:
+                raise serializers.ValidationError(
+                    f"Script too large. Max size is {self.MAX_SIZE/1024/1024}MB"
+                )
+            name = getattr(script_file, "name", "")
+            if not name.lower().endswith(".py"):
+                raise serializers.ValidationError("Only Python (.py) files allowed")
+
+            try:
+                content = script_file.read()
+                # content may be bytes
+                if isinstance(content, bytes):
+                    content = content.decode('utf-8')
+                compile(content, name or '<uploaded_script>', 'exec')
+            except SyntaxError as e:
+                raise serializers.ValidationError(f"Invalid Python syntax: {str(e)}")
+            finally:
+                try:
+                    script_file.seek(0)
+                except Exception:
+                    pass
+
+        # If text provided, validate Python syntax
+        if script_text:
+            try:
+                compile(script_text, '<script_text>', 'exec')
+            except SyntaxError as e:
+                raise serializers.ValidationError(f"Invalid Python syntax in script_text: {str(e)}")
+
+        return attrs
     
 class SubNodeFamilySerializer(serializers.ModelSerializer):
     class Meta:
