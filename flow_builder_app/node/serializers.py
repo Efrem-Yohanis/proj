@@ -96,7 +96,7 @@ class NodeFamilySerializer(serializers.ModelSerializer):
     is_deployed = serializers.BooleanField(read_only=True)
     # latest_version = serializers.SerializerMethodField()
     published_version = serializers.SerializerMethodField()
-    versions = NodeVersionSerializer(many=True, read_only=True)
+    versions = serializers.SerializerMethodField()
     
 
     class Meta:
@@ -107,44 +107,57 @@ class NodeFamilySerializer(serializers.ModelSerializer):
             ]
 
     def get_versions(self, obj):
+        """
+        For each node version, return parameters and for each subnode the value
+        taken from NodeParameter (version-level). Falls back to Parameter.default_value.
+        """
         node_versions = NodeVersion.objects.filter(family=obj).order_by("version")
+
+        # fetch subnodes once
+        subnodes = list(SubNode.objects.filter(node_family=obj))
+
         results = []
-        previous_keys = set()
-
         for nv in node_versions:
-            family_params = {p.parameter.key: p for p in nv.parameters.all()}
+            # NodeParameter objects for this version
+            node_params = NodeParameter.objects.filter(node_version=nv).select_related('parameter')
 
-            display_params = []
-            for key, param in family_params.items():
-                if nv.version == 1:
-                    display_params.append({
-                        "status": "Parameter",
-                        "key": param.parameter.key,
-                        "datatype": param.parameter.datatype
-                    })
-                else:
-                    if key in previous_keys:
-                        display_params.append({
-                            "status": "Inherits",
-                            "key": key,
-                            "datatype": param.datatype
-                        })
-                    else:
-                        display_params.append({
-                            "status": "Adds",
-                            "key": key,
-                            "datatype": param.datatype
-                        })
+            # parameters list for response
+            params = [
+                {
+                    "id": str(np.parameter.id),
+                    "key": np.parameter.key,
+                    "datatype": np.parameter.datatype,
+                    "default_value": np.parameter.default_value
+                }
+                for np in node_params
+            ]
 
-            previous_keys = set(family_params.keys())
+            # build map parameter_id -> value for this version
+            param_value_map = { str(np.parameter.id): np.value for np in node_params }
+
+            # For each subnode, apply the version-level value
+            subnodes_list = []
+            for sn in subnodes:
+                param_values = {}
+                for np in node_params:
+                    pid = str(np.parameter.id)
+                    value = param_value_map.get(pid)
+                    if value is None:
+                        value = np.parameter.default_value
+                    param_values[np.parameter.key] = value
+
+                subnodes_list.append({
+                    "id": str(sn.id),
+                    "name": sn.name,
+                    "parameter_values": param_values
+                })
 
             results.append({
                 "version": nv.version,
-                "parameters": display_params,
-                "subnodes": NodeFamilyVersionSerializer(nv, context={"family": obj}).get_subnodes(nv)
+                "parameters": params,
+                "subnodes": subnodes_list
             })
-
-        return NodeFamilyVersionSerializer(results, many=True).data
+        return results
 
 
     def __init__(self, *args, **kwargs):
@@ -450,15 +463,5 @@ class FamilyParameterSerializer(serializers.Serializer):
 
 class NodeFamilyVersionSerializer(serializers.Serializer):
     version = serializers.IntegerField()
-    parameters = FamilyParameterSerializer(many=True)
-    subnodes = serializers.SerializerMethodField()
-
-    def get_subnodes(self, obj):
-        subnodes = SubNode.objects.filter(node_family=obj.family)
-        return [
-            {
-                "name": sn.name,
-                "versions": SubNodeVersionSerializer(sn).data
-            }
-            for sn in subnodes
-        ]
+    parameters = serializers.ListField()
+    subnodes = serializers.ListField()

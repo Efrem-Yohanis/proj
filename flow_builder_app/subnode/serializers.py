@@ -4,7 +4,7 @@ from django.db.models import Q
 
 from flow_builder_app.subnode.models import SubNode
 from flow_builder_app.parameter.models import ParameterValue
-from flow_builder_app.node.models import NodeFamily, NodeVersion
+from flow_builder_app.node.models import NodeFamily, NodeVersion, NodeParameter
 
 from flow_builder_app.subnode.models import SubNodeParameterValue
 # ---------------- SubNode Version Serializer ----------------
@@ -33,8 +33,11 @@ class SubNodeVersionSerializer(serializers.ModelSerializer):
             if not node_version:
                 return []
 
-            # Get all ParameterValues for this SubNode
-            values = ParameterValue.objects.filter(subnode=obj)
+            # Get all parameters for this version
+            version_parameters = [np.parameter for np in node_version.parameters.select_related('parameter').all()]
+
+            # Get all ParameterValue objects for this subnode and these parameters
+            values = ParameterValue.objects.filter(subnode=obj, parameter__in=version_parameters)
 
             # Map values with parameter info
             return [
@@ -66,7 +69,8 @@ class SubNodeSerializer(serializers.ModelSerializer):
             fields = [
                 "id", "name", "description", "node_family",
                 "active_version", "original_version",
-                "created_at", "created_by", "versions"
+                "created_at", "versions",
+                "family_name", "family_id"
             ]
 
     def get_versions(self, obj):
@@ -77,25 +81,20 @@ class SubNodeSerializer(serializers.ModelSerializer):
         previous_params = {}
 
         for nv in node_versions:
-            # All family-level parameters for this node version
-            family_params = {p.key: p for p in nv.parameters.all()}
-
-            # SubNode's values for this version
-            param_values = {
-                pv.parameter.key: pv.value
-                for pv in ParameterValue.objects.filter(subnode=obj)
-            }
-
+            # Use NodeParameter to get parameter values for this subnode and version
+            node_params = NodeParameter.objects.filter(node_version=nv)
             display_params = []
-            for key, param in family_params.items():
-                value = param_values.get(key, param.default_value)
+            for np in node_params.select_related('parameter'):
+                value = np.value
+                key = np.parameter.key
+                datatype = np.parameter.datatype
 
                 if nv.version == 1:
                     display_params.append({
                         "status": "ParameterValue",
                         "key": key,
                         "value": value,
-                        "datatype": param.datatype
+                        "datatype": datatype
                     })
                 else:
                     if key in previous_params:
@@ -107,17 +106,17 @@ class SubNodeSerializer(serializers.ModelSerializer):
                             "status": status,
                             "key": key,
                             "value": value,
-                            "datatype": param.datatype
+                            "datatype": datatype
                         })
                     else:
                         display_params.append({
                             "status": "Adds",
                             "key": key,
                             "value": value,
-                            "datatype": param.datatype
+                            "datatype": datatype
                         })
 
-            previous_params = {p.key: param_values.get(p.key, p.default_value) for p in family_params.values()}
+            previous_params = {np.parameter.key: np.value for np in node_params}
 
             results.append({
                 "version": nv.version,

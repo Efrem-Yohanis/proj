@@ -9,6 +9,8 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
+from django.db import transaction
+
 from flow_builder_app.subnode.models import SubNodeParameterValue
 from .models import SubNode
 from flow_builder_app.parameter.models import ParameterValue,Parameter
@@ -63,24 +65,58 @@ class SubNodeViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         try:
-            self.perform_create(serializer)
-            new_subnode = serializer.instance
+            with transaction.atomic():
+                self.perform_create(serializer)
+                new_subnode = serializer.instance
 
-            # Get parameters through NodeVersion instead of NodeFamily
-            latest_version = new_subnode.node_family.versions.order_by('-version').first()
-            if latest_version:
-                node_parameters = Parameter.objects.filter(
-                    node_parameters__node_version=latest_version
-                ).distinct()
-                
-                for param in node_parameters:
-                    ParameterValue.objects.get_or_create(
-                        parameter=param,
-                        subnode=new_subnode,
-                        defaults={'value': param.default_value}
+                # Collect all unique parameter IDs used by any NodeVersion in this family
+                from flow_builder_app.node.models import NodeParameter
+
+                param_ids_qs = NodeParameter.objects.filter(
+                    node_version__family=new_subnode.node_family
+                ).values_list('parameter_id', flat=True).distinct()
+                param_ids = list(param_ids_qs)
+
+                if param_ids:
+                    # Fetch Parameter objects for defaults
+                    parameters = list(Parameter.objects.filter(id__in=param_ids).only('id', 'default_value'))
+
+                    # Create missing ParameterValue objects
+                    existing_pv_ids = set(
+                        ParameterValue.objects.filter(subnode=new_subnode, parameter_id__in=param_ids)
+                        .values_list('parameter_id', flat=True)
                     )
-            else:
-                logger.warning(f"No versions found for node family {new_subnode.node_family.id}")
+                    pv_objs = [
+                        ParameterValue(
+                            parameter=param,
+                            subnode=new_subnode,
+                            value=param.default_value
+                        )
+                        for param in parameters
+                        if param.id not in existing_pv_ids
+                    ]
+                    if pv_objs:
+                        ParameterValue.objects.bulk_create(pv_objs)
+
+                    # Create missing SubNodeParameterValue objects
+                    from flow_builder_app.subnode.models import SubNodeParameterValue
+                    existing_snpv_ids = set(
+                        SubNodeParameterValue.objects.filter(subnode=new_subnode, parameter_id__in=param_ids)
+                        .values_list('parameter_id', flat=True)
+                    )
+                    snpv_objs = [
+                        SubNodeParameterValue(
+                            parameter=param,
+                            subnode=new_subnode,
+                            value=param.default_value
+                        )
+                        for param in parameters
+                        if param.id not in existing_snpv_ids
+                    ]
+                    if snpv_objs:
+                        SubNodeParameterValue.objects.bulk_create(snpv_objs)
+                else:
+                    logger.info(f"No parameters found for node family {new_subnode.node_family.id}")
 
         except Exception as e:
             logger.error(f"Error creating subnode: {str(e)}")
@@ -332,91 +368,58 @@ class SubNodeViewSet(viewsets.ModelViewSet):
 
         return Response(response)
 
-    @action(detail=True, methods=['patch'], url_path='update_parameter_values')
+    @action(detail=True, methods=['patch'], url_path='update_parameter_values', url_name='update-parameter-values')
     def update_parameter_values(self, request, *args, **kwargs):
-        subnode = self.get_object()
+            subnode = self.get_object()
+            param_updates = request.data.get('parameter_values', [])
+            # optional: specific node version to sync (integer)
+            target_version = request.data.get('version') or request.query_params.get('version')
+            if target_version is not None:
+                try:
+                    target_version = int(target_version)
+                except (ValueError, TypeError):
+                    return Response({"error": "Invalid 'version' value"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not subnode.is_editable:
+            updated, errors = [], []
+
+            for item in param_updates:
+                param_id = item.get('id')
+                new_value = item.get('value')
+
+                if not param_id or new_value is None:
+                    errors.append({"id": param_id, "error": "Both 'id' and 'value' are required"})
+                    continue
+
+                obj = (
+                    ParameterValue.objects.filter(id=param_id, subnode=subnode).first()
+                    or SubNodeParameterValue.objects.filter(id=param_id, subnode=subnode).first()
+                )
+
+                if obj:
+                    obj.value = new_value
+                    obj.save(update_fields=["value"])
+
+                    # Sync NodeParameter values for this parameter to a specific version if requested
+                    try:
+                        from flow_builder_app.node.models import NodeParameter
+                        filters = {
+                            "node_version__family": subnode.node_family,
+                            "parameter": obj.parameter
+                        }
+                        if target_version is not None:
+                            filters["node_version__version"] = target_version
+                        NodeParameter.objects.filter(**filters).update(value=new_value)
+                    except Exception:
+                        logger.exception("Failed to sync NodeParameter for parameter %s", getattr(obj.parameter, 'id', None))
+
+                    updated.append({"id": str(obj.id), "value": obj.value})
+                else:
+                    errors.append({"id": param_id, "error": "Not found for this subnode"})
+
             return Response(
-                {"error": "This subnode version is deployed and cannot be edited."},
-                status=status.HTTP_400_BAD_REQUEST
+                {"updated": updated, "errors": errors},
+                status=status.HTTP_200_OK if updated else status.HTTP_400_BAD_REQUEST
             )
-
-        parameter_values = request.data.get('parameter_values', [])
-        updated = []
-        errors = []
-
-        for pv in parameter_values:
-            pv_id = pv.get('id')
-            value = pv.get('value')
-
-            if not pv_id:
-                errors.append({"error": "ParameterValue id is required"})
-                continue
-
-            try:
-                param_val = subnode.parameter_values.get(id=pv_id)
-                param_val.value = value
-                param_val.save()
-                updated.append({
-                    "id": str(param_val.id),
-                    "parameter_key": param_val.parameter.key,
-                    "value": param_val.value
-                })
-            except ParameterValue.DoesNotExist:
-                errors.append({"error": f"ParameterValue {pv_id} not found for this subnode"})
-
-        return Response({"updated": updated, "errors": errors})
-
-
-    # @action(detail=True, methods=['patch'], url_path='update_parameter_values')
-    # def update_parameter_values(self, request, *args, **kwargs):
-    #     subnode = self.get_object()
-
-    #     if not subnode.is_editable:
-    #         return Response(
-    #             {"error": "This subnode version is deployed and cannot be edited."},
-    #             status=status.HTTP_400_BAD_REQUEST
-    #         )
-
-    #     parameter_values = request.data.get('parameter_values', [])
-    #     updated = []
-    #     errors = []
-
-    #     for pv in parameter_values:
-    #         param_id = pv.get('parameter')  # Expecting parameter UUID from frontend
-    #         value = pv.get('value')
-
-    #         if not param_id:
-    #             errors.append({"error": "Parameter ID is required"})
-    #             continue
-
-    #         try:
-    #             # Try to get the ParameterValue for this subnode + parameter
-    #             param_val, created = ParameterValue.objects.get_or_create(
-    #                 subnode=subnode,
-    #                 parameter_id=param_id,
-    #                 defaults={'value': value}
-    #             )
-
-    #             if not created:
-    #                 param_val.value = value
-    #                 param_val.save()
-
-    #             updated.append({
-    #                 "id": str(param_val.id),
-    #                 "parameter": str(param_val.parameter.id),
-    #                 "parameter_key": param_val.parameter.key,
-    #                 "value": param_val.value,
-    #                 "created": created
-    #             })
-
-    #         except Parameter.DoesNotExist:
-    #             errors.append({"error": f"Parameter {param_id} does not exist"})
-
-    #     return Response({"updated": updated, "errors": errors})
-
-
     @action(detail=True, methods=['get'], url_path='export')
     def export(self, request, **kwargs):
         subnode = self.get_object()
@@ -538,7 +541,6 @@ class SubNodeViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(cloned_subnode)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
-
     @action(detail=True, methods=['patch'], url_path='edit_with_parameters')
     def edit_with_parameters(self, request, pk=None):
         subnode = self.get_object()
@@ -555,14 +557,18 @@ class SubNodeViewSet(viewsets.ModelViewSet):
         for param_data in parameter_values_data:
             try:
                 param_value = ParameterValue.objects.get(id=param_data['id'], subnode=subnode)
-                param_serializer = ParameterValueUpdateSerializer(param_value, data={'value': param_data['value']}, partial=True)
+                param_serializer = ParameterValueUpdateSerializer(
+                    param_value, data={'value': param_data['value']}, partial=True
+                )
                 if param_serializer.is_valid():
                     param_serializer.save()
                 else:
                     return Response(param_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
             except ParameterValue.DoesNotExist:
-                return Response({"error": f"ParameterValue {param_data['id']} not found for this subnode"},
-                                status=status.HTTP_404_NOT_FOUND)
+                return Response(
+                    {"error": f"ParameterValue {param_data['id']} not found for this subnode"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
 
         return Response({
             "message": "Subnode and parameter values updated successfully",

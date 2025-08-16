@@ -13,3 +13,8 @@ admin.site.register(NodeParameter)
 admin.site.register(NodeVersion)
 admin.site.register(NodeVersionLink)
 admin.site.register(NodeExecution)
+
+admin.site.register(SubNode)
+admin.site.register(SubNodeParameterValue)
+admin.site.register(Parameter)
+admin.site.register(ParameterValue)

@@ -232,6 +232,15 @@ class NodeFamilyViewSet(viewsets.ModelViewSet):
         family.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @action(detail=True, methods=['GET'], url_path='full_structure')
+    def full_structure(self, request, id=None):
+        """
+        Return the node family with all versions, parameters, and subnodes/parameter values.
+        """
+        family = self.get_object()
+        serializer = self.get_serializer(family)
+        return Response(serializer.data)
+
 
 class VersionViewSet(viewsets.GenericViewSet,
                    mixins.ListModelMixin,
@@ -247,16 +256,17 @@ class VersionViewSet(viewsets.GenericViewSet,
     permission_classes = [permissions.AllowAny]
 
     def get_queryset(self):
+        family_id = self.kwargs.get('family_pk') or self.kwargs.get('family_id')
+        if not family_id:
+            raise Exception("family_pk or family_id is required in the URL for this viewset.")
         return NodeVersion.objects.filter(
-            family_id=self.kwargs['family_id']
+            family_id=family_id
         ).select_related('family').prefetch_related(
             Prefetch(
                 'child_links',
-                queryset=NodeVersionLink.objects.select_related(
-                    'child_version__family'
-                ).prefetch_related(
+                queryset=NodeVersionLink.objects.select_related('child_version', 'child_version__family').prefetch_related(
                     Prefetch(
-                        'child_version__nodeparameter_set',
+                        'child_version__parameters',
                         queryset=NodeParameter.objects.select_related('parameter'),
                         to_attr='prefetched_parameters'
                     )
@@ -264,7 +274,7 @@ class VersionViewSet(viewsets.GenericViewSet,
                 to_attr='prefetched_child_links'
             ),
             Prefetch(
-                'nodeparameter_set',
+                'parameters',
                 queryset=NodeParameter.objects.select_related('parameter'),
                 to_attr='prefetched_parameters'
             )
@@ -282,6 +292,14 @@ class VersionViewSet(viewsets.GenericViewSet,
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
+            # Require at least one active (published) version to create a new version
+            active_version = family.versions.filter(state='published').order_by('-version').first()
+            if not active_version:
+                return Response(
+                    {"error": "Cannot create a new version when there is no active (published) version for this family."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
             max_version = family.versions.aggregate(Max('version'))['version__max'] or 0
             new_version = NodeVersion.objects.create(
                 family=family,
@@ -291,26 +309,27 @@ class VersionViewSet(viewsets.GenericViewSet,
                 created_by=request.user.username
             )
 
-            source_version_num = serializer.validated_data.get('source_version')
+            # Choose source: explicit source_version if provided, else use the active published version
+            source_version_num = serializer.validated_data.get('source_version') or active_version.version
             if source_version_num is not None:
                 source = get_object_or_404(
                     NodeVersion,
                     family=family,
                     version=source_version_num
                 )
-                # Copy script
+                # Copy script from source
                 new_version.script = source.script
                 new_version.save()
-                # Copy parameters in bulk
+                # Copy parameters in bulk from the chosen source
                 NodeParameter.objects.bulk_create([
                     NodeParameter(
                         node_version=new_version,
                         parameter=np.parameter,
                         value=np.value
                     )
-                    for np in source.nodeparameter_set.all()
+                    for np in source.parameters.select_related('parameter').all()
                 ])
-                # Copy subnode links in bulk
+                # Copy subnode links in bulk from the chosen source
                 NodeVersionLink.objects.bulk_create([
                     NodeVersionLink(
                         parent_version=new_version,
@@ -550,7 +569,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
     
     @action(detail=True, methods=['POST'], url_path='add_parameter')
     def add_parameter(self, request, family_id=None, version=None):
-        """Add parameters to this version using parameter IDs"""
+        """Add parameters to this version using parameter IDs and create default ParameterValue for each subnode."""
         node_version = self.get_object()
 
         if node_version.state == 'published':
@@ -585,7 +604,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                 parameters = Parameter.objects.filter(
                     id__in=param_ids,
                     is_active=True
-                ).only('id', 'key', 'default_value')  # Only fetch needed fields
+                ).only('id', 'key', 'default_value')
 
                 # Check for missing parameters
                 found_ids = {str(p.id) for p in parameters}
@@ -596,14 +615,12 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-                # Check for existing parameters
+                # Check for existing parameters (as UUIDs)
                 existing_params = set(
-                    node_version.parameters.filter(
-                        parameter_id__in=param_ids
-                    ).values_list('parameter_id', flat=True)
+                    node_version.parameters.values_list('parameter_id', flat=True)
                 )
 
-                # Create new parameters
+                # Only create NodeParameter for parameters not already present
                 new_params = [
                     NodeParameter(
                         node_version=node_version,
@@ -611,15 +628,52 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                         value=param.default_value if hasattr(param, 'default_value') else None
                     )
                     for param in parameters
-                    if str(param.id) not in existing_params
+                    if param.id not in existing_params
                 ]
 
-                # Bulk create if we have new parameters
+                # Bulk create NodeParameter
                 if new_params:
                     NodeParameter.objects.bulk_create(new_params)
                     added_count = len(new_params)
                 else:
                     added_count = 0
+
+                # Automatically create ParameterValue for each subnode for each new parameter
+                from flow_builder_app.parameter.models import ParameterValue
+                from flow_builder_app.subnode.models import SubNode
+
+                subnodes = SubNode.objects.filter(node_family=node_version.family)
+                paramvalue_objs = []
+                for param in parameters:
+                    if str(param.id) not in existing_params:
+                        for subnode in subnodes:
+                            # Only create if not already exists
+                            if not ParameterValue.objects.filter(parameter=param, subnode=subnode).exists():
+                                paramvalue_objs.append(ParameterValue(
+                                    parameter=param,
+                                    subnode=subnode,
+                                    value=param.default_value
+                                ))
+                if paramvalue_objs:
+                    ParameterValue.objects.bulk_create(paramvalue_objs)
+
+                # Automatically create SubNodeParameterValue for each subnode for each new parameter
+                from flow_builder_app.subnode.models import SubNode, SubNodeParameterValue
+
+                subnodes = SubNode.objects.filter(node_family=node_version.family)
+                sn_paramvalue_objs = []
+                for param in parameters:
+                    if str(param.id) not in existing_params:
+                        for subnode in subnodes:
+                            # Only create if not already exists
+                            if not SubNodeParameterValue.objects.filter(parameter=param, subnode=subnode).exists():
+                                sn_paramvalue_objs.append(SubNodeParameterValue(
+                                    parameter=param,
+                                    subnode=subnode,
+                                    value=param.default_value
+                                ))
+                if sn_paramvalue_objs:
+                    SubNodeParameterValue.objects.bulk_create(sn_paramvalue_objs)
 
                 return Response(
                     {
@@ -667,7 +721,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
 
         with transaction.atomic():
             # Validate parameters exist before deletion
-            existing_params = node_version.nodeparameter_set.filter(
+            existing_params = node_version.parameters.filter(
                 parameter_id__in=param_ids
             ).values_list('parameter_id', flat=True)
             
@@ -678,7 +732,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            deleted_count, _ = node_version.nodeparameter_set.filter(
+            deleted_count, _ = node_version.parameters.filter(
                 parameter_id__in=param_ids
             ).delete()
 
