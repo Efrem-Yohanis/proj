@@ -445,7 +445,6 @@ class VersionViewSet(viewsets.GenericViewSet,
         version_obj.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-
 class ExecutionViewSet(viewsets.GenericViewSet):
     """
     ViewSet for NodeExecution operations
@@ -510,8 +509,6 @@ class ExecutionViewSet(viewsets.GenericViewSet):
             {"status": "Execution stopped"}, 
             status=status.HTTP_200_OK
         )
-
-
 class VersionContentViewSet(viewsets.GenericViewSet):
     """
     ViewSet for version content management (scripts, parameters)
@@ -601,7 +598,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
 
                 # Check for existing parameters
                 existing_params = set(
-                    node_version.nodeparameter_set.filter(
+                    node_version.parameters.filter(
                         parameter_id__in=param_ids
                     ).values_list('parameter_id', flat=True)
                 )

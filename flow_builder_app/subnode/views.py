@@ -9,7 +9,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
-
+from flow_builder_app.subnode.models import SubNodeParameterValue
 from .models import SubNode
 from flow_builder_app.parameter.models import ParameterValue,Parameter
 from flow_builder_app.node.models import NodeFamily
@@ -300,7 +300,7 @@ class SubNodeViewSet(viewsets.ModelViewSet):
 
             versions_list = []
             for v in versions_sorted:
-                param_values_qs = ParameterValue.objects.filter(subnode=v)
+                param_values_qs = SubNodeParameterValue.objects.filter(subnode=v)
                 param_values = [dict(
                     id=str(pv.id),
                     parameter_key=pv.parameter.key,

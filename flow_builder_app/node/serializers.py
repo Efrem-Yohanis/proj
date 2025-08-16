@@ -11,7 +11,82 @@ from flow_builder_app.node.models import (
     NodeVersionLink
 )
 from flow_builder_app.parameter.models import Parameter,ParameterValue
+from flow_builder_app.subnode.serializers import SubNodeVersionSerializer
+from flow_builder_app.subnode.models import SubNode
 
+
+class NodeVersionSerializer(serializers.ModelSerializer):
+    family_name = serializers.CharField(source='family.name', read_only=True)
+    parameters = serializers.SerializerMethodField()
+    subnodes = serializers.SerializerMethodField()
+    script_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NodeVersion
+        fields = [
+            "id",
+            "version",
+            "state",
+            "changelog",
+            "family",
+            "family_name",
+            "script_url",
+            "parameters",
+            "subnodes",
+            "created_at",
+            "created_by"
+        ]
+        read_only_fields = fields
+
+    def get_parameters(self, obj):
+        # Use the related_name='parameters' from NodeParameter
+        return [
+            {
+                "id": str(np.id),
+                "parameter_id": str(np.parameter.id),
+                "key": np.parameter.key,
+                "value": np.value,
+                "datatype": getattr(np.parameter, 'datatype', None)
+            }
+            for np in obj.parameters.select_related('parameter').all()
+        ]
+
+    def get_script_url(self, obj):
+        request = self.context.get("request")
+        if obj.script and request:
+            return request.build_absolute_uri(obj.script.url)
+        return None
+
+    def get_subnodes(self, obj):
+        # Get linked subnodes from NodeVersionLink
+        links = obj.child_links.select_related('child_version__family').all()
+        result = []
+        subnodes = SubNode.objects.filter(node_family=obj.family)
+        for link in links:
+            child_version = link.child_version
+            result.append({
+                "link_id": str(link.id),
+                "order": link.order,
+                "family": {
+                    "id": str(child_version.family.id),
+                    "name": child_version.family.name,
+                    "is_deployed": child_version.family.is_deployed
+                },
+                "version": {
+                    "id": str(child_version.id),
+                    "version": child_version.version,
+                    "state": child_version.state,
+                    "parameters": [
+                        {
+                            "key": np.parameter.key,
+                            "value": np.value,
+                            "datatype": getattr(np.parameter, 'datatype', None)
+                        }
+                        for np in child_version.parameters.select_related('parameter').all()
+                    ]
+                }
+            })
+        return result
 
 class NodeFamilySerializer(serializers.ModelSerializer):
     """
@@ -21,24 +96,55 @@ class NodeFamilySerializer(serializers.ModelSerializer):
     is_deployed = serializers.BooleanField(read_only=True)
     # latest_version = serializers.SerializerMethodField()
     published_version = serializers.SerializerMethodField()
-    versions = serializers.SerializerMethodField()
-   
+    versions = NodeVersionSerializer(many=True, read_only=True)
+    
 
     class Meta:
-        model = NodeFamily
-        fields = [
-            "id", "name", "description", "created_at", "updated_at",
-            "created_by", "is_deployed", "published_version", 
-            "versions"
-        ]
-        read_only_fields = [
-            "created_at", "updated_at", "is_deployed", 
-            "published_version", "versions"
-        ]
-    
+            model = NodeFamily
+            fields = [
+                "id", "name", "description", "created_at", "updated_at",
+                "created_by", "is_deployed", "published_version", "versions"
+            ]
+
     def get_versions(self, obj):
-        versions_qs = obj.versions.all().order_by('-version')
-        return NodeVersionSerializer(versions_qs, many=True).data
+        node_versions = NodeVersion.objects.filter(family=obj).order_by("version")
+        results = []
+        previous_keys = set()
+
+        for nv in node_versions:
+            family_params = {p.parameter.key: p for p in nv.parameters.all()}
+
+            display_params = []
+            for key, param in family_params.items():
+                if nv.version == 1:
+                    display_params.append({
+                        "status": "Parameter",
+                        "key": param.parameter.key,
+                        "datatype": param.parameter.datatype
+                    })
+                else:
+                    if key in previous_keys:
+                        display_params.append({
+                            "status": "Inherits",
+                            "key": key,
+                            "datatype": param.datatype
+                        })
+                    else:
+                        display_params.append({
+                            "status": "Adds",
+                            "key": key,
+                            "datatype": param.datatype
+                        })
+
+            previous_keys = set(family_params.keys())
+
+            results.append({
+                "version": nv.version,
+                "parameters": display_params,
+                "subnodes": NodeFamilyVersionSerializer(nv, context={"family": obj}).get_subnodes(nv)
+            })
+
+        return NodeFamilyVersionSerializer(results, many=True).data
 
 
     def __init__(self, *args, **kwargs):
@@ -106,93 +212,6 @@ class NodeVersionLinkSerializer(serializers.ModelSerializer):
             obj.child_version, 
             context=self.context
         ).data
-
-class NodeVersionSerializer(serializers.ModelSerializer):
-    script_url = serializers.SerializerMethodField()
-    parameters = serializers.SerializerMethodField()
-    subnodes = serializers.SerializerMethodField()
-    family_name = serializers.CharField(source='family.name', read_only=True)
-
-    class Meta:
-        model = NodeVersion
-        fields = [
-            "id", "version", "state", "changelog", "family", "family_name",
-            "script_url", "parameters", "subnodes",
-            "created_at", "created_by"
-        ]
-        read_only_fields = fields
-
-    def get_family_parameters(self, obj):
-        """Get parameters available to all versions in this family"""
-        # Get all unique parameters ever used in this family's versions
-        parameter_ids = NodeParameter.objects.filter(
-            node_version__family=obj.family
-        ).values_list('parameter_id', flat=True).distinct()
-
-        # Get the parameter objects
-        parameters = Parameter.objects.filter(id__in=parameter_ids)
-
-        return [
-            {
-                "id": str(param.id),
-                "key": param.key,
-                "datatype": getattr(param, 'datatype', None),
-                "default_value": param.default_value,
-                "is_active": param.is_active
-            }
-            for param in parameters
-        ]
-
-    def get_parameters(self, obj):
-        """Get parameters specific to this version"""
-        parameters = obj.nodeparameter_set.select_related('parameter').all()
-        return [
-            {
-                "id": str(np.id),
-                "parameter_id": str(np.parameter.id),
-                "key": np.parameter.key,
-                "value": np.value,
-                "datatype": getattr(np.parameter, 'datatype', None)
-            }
-            for np in parameters
-        ]
-
-    def get_script_url(self, obj):
-        request = self.context.get("request")
-        if obj.script and request:
-            return request.build_absolute_uri(obj.script.url)
-        return None
-
-    def get_subnodes(self, obj):
-        """Get all linked subnode families for this version"""
-        links = obj.child_links.select_related('child_version__family').all()
-        
-        return [
-            {
-                "link_id": str(link.id),
-                "order": link.order,
-                "family": {
-                    "id": str(link.child_version.family.id),
-                    "name": link.child_version.family.name,
-                    "is_deployed": link.child_version.family.is_deployed
-                },
-                "version": {
-                    "id": str(link.child_version.id),
-                    "version": link.child_version.version,
-                    "state": link.child_version.state,
-                    "parameters": [
-                        {
-                            "key": np.parameter.key,
-                            "value": np.value,
-                            "datatype": getattr(np.parameter, 'datatype', None)
-                        }
-                        for np in getattr(link.child_version, 'nodeparameter_set', []).all()
-                    ]
-                }
-            }
-            for link in links
-        ]
-    
 class NodeExecutionSerializer(serializers.ModelSerializer):
     """
     Serializer for NodeExecution records with detailed version info
@@ -420,3 +439,26 @@ class NodeVersionDetailSerializer(serializers.ModelSerializer):
             child_version__family=obj.family
         )
         return SubnodeSerializer(links, many=True).data
+
+
+
+class FamilyParameterSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    key = serializers.CharField()
+    datatype = serializers.CharField(required=False)
+
+
+class NodeFamilyVersionSerializer(serializers.Serializer):
+    version = serializers.IntegerField()
+    parameters = FamilyParameterSerializer(many=True)
+    subnodes = serializers.SerializerMethodField()
+
+    def get_subnodes(self, obj):
+        subnodes = SubNode.objects.filter(node_family=obj.family)
+        return [
+            {
+                "name": sn.name,
+                "versions": SubNodeVersionSerializer(sn).data
+            }
+            for sn in subnodes
+        ]

@@ -14,7 +14,7 @@ class NodeFamily(models.Model):
     created_by = models.CharField(max_length=255)
     is_deployed = models.BooleanField(default=False)
 
-# Corrected relationship
+    # Corrected relationship
     child_nodes = models.ManyToManyField(
         'self',
         through='NodeFamilyRelationship',
@@ -30,11 +30,10 @@ class NodeFamily(models.Model):
             models.Index(fields=['is_deployed']),
         ]
 
-
     def clean(self):
-        if self.pk and self.versions.exists():
+        if self.pk:
             original = NodeFamily.objects.get(pk=self.pk)
-            if original.name != self.name:
+            if original.name != self.name and original.versions.exists():
                 raise ValidationError("Cannot rename a family with existing versions")
 
     def has_deployed_versions(self):
@@ -42,6 +41,7 @@ class NodeFamily(models.Model):
 
     def __str__(self):
         return f"{self.name} (Family)"
+
 
 class NodeFamilyRelationship(models.Model):
     """Through model for subnode relationships"""
@@ -61,6 +61,8 @@ class NodeFamilyRelationship(models.Model):
     class Meta:
         unique_together = ('parent', 'child')
         ordering = ['order']
+
+
 class NodeVersion(models.Model):
     VERSION_STATES = (
         ('draft', 'Draft'),
@@ -72,13 +74,13 @@ class NodeVersion(models.Model):
     family = models.ForeignKey(
         NodeFamily, on_delete=models.CASCADE, related_name='versions'
     )
-    version = models.PositiveIntegerField()
+    version = models.PositiveIntegerField(blank=True, null=True)
     state = models.CharField(max_length=20, choices=VERSION_STATES, default='draft')
     script = models.FileField(upload_to='node_scripts/%Y/%m/%d/', null=True, blank=True)
     changelog = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.CharField(max_length=255)
-    
+
     # Explicit version links for subnodes
     linked_subversions = models.ManyToManyField(
         'self',
@@ -99,15 +101,23 @@ class NodeVersion(models.Model):
         if self.state == 'published' and not self.script:
             raise ValidationError("Published versions must have a script")
 
+    def save(self, *args, **kwargs):
+        # Auto-increment version if not provided
+        if self.version is None:
+            last_version = NodeVersion.objects.filter(family=self.family).aggregate(Max('version'))['version__max'] or 0
+            self.version = last_version + 1
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.family.name} v{self.version} ({self.state})"
+
 
 class NodeParameter(models.Model):
     """Through model for version-specific parameter values"""
     node_version = models.ForeignKey(
         NodeVersion,
         on_delete=models.CASCADE,
-        related_name='nodeparameter_set'
+        related_name='parameters'
     )
     parameter = models.ForeignKey(
         'flow_builder_app.Parameter',
@@ -123,6 +133,7 @@ class NodeParameter(models.Model):
     def __str__(self):
         return f"{self.parameter.key} on {self.node_version}"
 
+
 class NodeVersionLink(models.Model):
     """Through model for version-specific subnode links"""
     parent_version = models.ForeignKey(
@@ -136,24 +147,28 @@ class NodeVersionLink(models.Model):
         related_name='parent_links'
     )
     order = models.PositiveIntegerField(default=0)
-    
+
     class Meta:
         unique_together = ('parent_version', 'child_version')
         ordering = ['order']
-        
+
     def clean(self):
         # Prevent circular references
         if self.parent_version.family == self.child_version.family:
             raise ValidationError("Cannot link versions from the same family")
-            
+
         # Verify child is from a subnode family
-        if not self.parent_version.family.subnodes.filter(id=self.child_version.family.id).exists():
+        if not NodeFamilyRelationship.objects.filter(
+            parent=self.parent_version.family,
+            child=self.child_version.family
+        ).exists():
             raise ValidationError("Child version must be from a subnode family")
-            
-        # Ensure child version is published if required
+
+        # Ensure child version is published
         if self.child_version.state != 'published':
             raise ValidationError("Can only link to published versions")
-           
+
+
 class NodeExecution(models.Model):
     """Execution record for a node version"""
     STATUS_CHOICES = [
@@ -195,6 +210,8 @@ class NodeExecution(models.Model):
             raise ValidationError("Completed executions must have an end time")
         if self.status == 'running' and not self.started_at:
             raise ValidationError("Running executions must have a start time")
+        if self.completed_at and self.started_at and self.completed_at < self.started_at:
+            raise ValidationError("Completed time cannot be before started time")
 
     def __str__(self):
         return f"Execution {self.id.hex[:8]} of {self.version} ({self.status})"

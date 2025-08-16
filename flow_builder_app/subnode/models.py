@@ -3,6 +3,7 @@ from django.db import models, transaction
 from django.core.exceptions import ValidationError
 from django.db.models import Q, Max
 from flow_builder_app.node.models import NodeFamily,NodeVersionLink,NodeVersion
+from flow_builder_app.parameter.models import Parameter,ParameterValue
 
 class SubNode(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -181,3 +182,17 @@ class SubNode(models.Model):
                 )
             
             return original
+
+
+
+class SubNodeParameterValue(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    subnode = models.ForeignKey(SubNode, on_delete=models.CASCADE, related_name='parametervalues')
+    parameter = models.ForeignKey(Parameter, on_delete=models.CASCADE)
+    value = models.JSONField()
+
+    class Meta:
+        unique_together = ('subnode', 'parameter')
+
+    def __str__(self):
+        return f"{self.parameter.key} = {self.value} ({self.subnode.name})"
