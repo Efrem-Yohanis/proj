@@ -14,6 +14,11 @@ class SubNode(models.Model):
     original = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL, related_name='versions')
     description = models.TextField(blank=True, null=True)
     version_comment = models.TextField(blank=True, null=True)
+
+    # New audit fields
+    created_by = models.CharField(max_length=255, blank=True, null=True)
+    updated_by = models.CharField(max_length=255, blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
