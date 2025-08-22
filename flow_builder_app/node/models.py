@@ -3,7 +3,6 @@ from uuid import uuid4
 from django.core.exceptions import ValidationError
 from django.db.models import Max
 
-
 class NodeFamily(models.Model):
     """Represents a group of versioned nodes"""
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
@@ -14,7 +13,6 @@ class NodeFamily(models.Model):
     created_by = models.CharField(max_length=255)
     is_deployed = models.BooleanField(default=False)
 
-    # Corrected relationship
     child_nodes = models.ManyToManyField(
         'self',
         through='NodeFamilyRelationship',
@@ -81,7 +79,6 @@ class NodeVersion(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.CharField(max_length=255)
 
-    # Explicit version links for subnodes
     linked_subversions = models.ManyToManyField(
         'self',
         through='NodeVersionLink',
@@ -102,9 +99,10 @@ class NodeVersion(models.Model):
             raise ValidationError("Published versions must have a script")
 
     def save(self, *args, **kwargs):
-        # Auto-increment version if not provided
         if self.version is None:
-            last_version = NodeVersion.objects.filter(family=self.family).aggregate(Max('version'))['version__max'] or 0
+            last_version = NodeVersion.objects.filter(family=self.family).aggregate(
+                Max('version')
+            )['version__max'] or 0
             self.version = last_version + 1
         super().save(*args, **kwargs)
 
@@ -153,18 +151,15 @@ class NodeVersionLink(models.Model):
         ordering = ['order']
 
     def clean(self):
-        # Prevent circular references
         if self.parent_version.family == self.child_version.family:
             raise ValidationError("Cannot link versions from the same family")
 
-        # Verify child is from a subnode family
         if not NodeFamilyRelationship.objects.filter(
             parent=self.parent_version.family,
             child=self.child_version.family
         ).exists():
             raise ValidationError("Child version must be from a subnode family")
 
-        # Ensure child version is published
         if self.child_version.state != 'published':
             raise ValidationError("Can only link to published versions")
 
@@ -190,7 +185,7 @@ class NodeExecution(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
     log = models.TextField(blank=True)
     triggered_by = models.CharField(max_length=255)
-    artifacts = models.JSONField(default=dict)
+    artifacts = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ['-started_at']

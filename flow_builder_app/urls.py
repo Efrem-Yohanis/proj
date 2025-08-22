@@ -7,7 +7,15 @@ from flow_builder_app.node.views import (
     VersionViewSet,
     DeploymentViewSet,
     VersionContentViewSet,
-    ExecutionViewSet
+    ExecutionViewSet,
+    NodeTestViewSet
+)
+from flow_builder_app.flow.views import (
+    FlowViewSet,
+    FlowNodeViewSet,
+    FlowEdgeViewSet,
+    FlowExecutionViewSet,
+    NodeExecutionLogViewSet,
 )
 
 # Base router
@@ -16,15 +24,26 @@ router.register(r'parameters', ParameterViewSet, basename='parameter')
 router.register(r'parameter-values', ParameterValueViewSet, basename='parametervalue')
 router.register(r'subnodes', SubNodeViewSet, basename='subnode')
 router.register(r'node-families', NodeFamilyViewSet, basename='nodefamily')
+router.register(r'executions', ExecutionViewSet, basename='execution')  # <-- ADD THIS LINE
+
+# --- Flow endpoints ---
+router.register(r'flows', FlowViewSet, basename='flow')
+router.register(r'flow-nodes', FlowNodeViewSet, basename='flownode')
+router.register(r'flow-edges', FlowEdgeViewSet, basename='flowedge')
+router.register(r'flow-executions', FlowExecutionViewSet, basename='flowexecution')
+router.register(r'node-execution-logs', NodeExecutionLogViewSet, basename='nodeexecutionlog')
 
 # Nested router for versions under node-families
 version_router = routers.NestedSimpleRouter(router, r'node-families', lookup='family')
 version_router.register(r'versions', VersionViewSet, basename='version')
-version_router.register(r'executions', ExecutionViewSet, basename='execution')
+version_router.register(r'executions', ExecutionViewSet, basename='family-execution')  # <-- Change basename
 
 # Nested router for content under versions
 content_router = routers.NestedSimpleRouter(version_router, r'versions', lookup='version')
 content_router.register(r'content', VersionContentViewSet, basename='versioncontent')
+
+# Node Test endpoint
+router.register(r'nodes/test', NodeTestViewSet, basename='node-test')
 
 urlpatterns = [
     path('', include(router.urls)),
@@ -32,7 +51,7 @@ urlpatterns = [
     path('', include(content_router.urls)),
 ]
 
-# Deployment URLs (added separately for cleaner endpoints)
+# Deployment URLs
 deployment_urls = [
     re_path(
         r'^node-families/(?P<family_id>[^/]+)/versions/(?P<version>[^/]+)/deploy/$',
@@ -46,6 +65,7 @@ deployment_urls = [
     ),
 ]
 
+# Script URLs
 script_urls = [
     re_path(
         r'^node-families/(?P<family_id>[^/]+)/versions/(?P<version>[^/]+)/script/$',
@@ -53,7 +73,8 @@ script_urls = [
         name='version-script'
     ),
 ]
-# Parameter URLs (with fixed typo)
+
+# Parameter URLs
 param_urls = [
     re_path(
         r'^node-families/(?P<family_id>[^/]+)/versions/(?P<version>[^/]+)/add_parameter/$',
@@ -67,4 +88,28 @@ param_urls = [
     ),
 ]
 
-urlpatterns += deployment_urls + param_urls + script_urls
+# Execution action URLs - ADD THESE
+execution_urls = [
+    re_path(
+        r'^executions/start/$',
+        ExecutionViewSet.as_view({'post': 'start_execution'}),
+        name='execution-start'
+    ),
+    re_path(
+        r'^executions/(?P<pk>[^/]+)/stop/$',
+        ExecutionViewSet.as_view({'post': 'stop_execution'}),
+        name='execution-stop'
+    ),
+    re_path(
+        r'^executions/(?P<pk>[^/]+)/status/$',
+        ExecutionViewSet.as_view({'get': 'execution_status'}),
+        name='execution-status'
+    ),
+    re_path(
+        r'^executions/(?P<pk>[^/]+)/logs/$',
+        ExecutionViewSet.as_view({'get': 'execution_logs'}),
+        name='execution-logs'
+    ),
+]
+
+urlpatterns += deployment_urls + param_urls + script_urls + execution_urls  # <-- Add execution_urls

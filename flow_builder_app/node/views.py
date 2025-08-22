@@ -10,7 +10,17 @@ from rest_framework.decorators import action
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
-
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from .models import NodeExecution, NodeVersion
+from .serializers import NodeExecutionSerializer
+from .node_runner import NodeRunner
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from datetime import datetime
+from flow_builder_app.subnode.models import SubNode, SubNodeParameterValue
+import threading
 from flow_builder_app.parameter.models import Parameter
 from flow_builder_app.node.models import (
     NodeFamily, 
@@ -31,8 +41,9 @@ from flow_builder_app.node.serializers import (
     NodeVersionLinkSerializer
 )
 
-logger = logging.getLogger(__name__)
+from uuid import UUID
 
+logger = logging.getLogger(__name__)
 
 class NodeFamilyViewSet(viewsets.ModelViewSet):
     """
@@ -68,17 +79,46 @@ class NodeFamilyViewSet(viewsets.ModelViewSet):
         total_count = len(data)
 
         # Count published and draft based on `is_deployed`
-        published_count = sum(1 for nf in data if nf.get('is_deployed') is True)
-        draft_count = sum(1 for nf in data if nf.get('is_deployed') is False)
+        # published_count = sum(1 for nf in data if nf.get('is_deployed') is True)
+        # draft_count = sum(1 for nf in data if nf.get('is_deployed') is False)
 
-        # Wrap the original list into an object with counts
+        # # Wrap the original list into an object with counts
+        # response_data = {
+        #     "total": total_count,
+        #     "published": published_count,
+        #     "draft": draft_count,
+        #     "results": data
+        # }
+        # return Response(response_data)
+        # Apply pagination (if enabled)
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            data = serializer.data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            data = serializer.data
+
+        total_count = len(data)
+        published_count = sum(1 for nf in data if nf.get("is_deployed") is True)
+        draft_count = total_count - published_count
+
         response_data = {
-            "total": total_count,
-            "published": published_count,
-            "draft": draft_count,
-            "results": data
+            "status": "success",
+            "message": "Node families retrieved successfully",
+            "summary": {
+                "total": total_count,
+                "published": published_count,
+                "draft": draft_count,
+            },
+            "results": data,
         }
-        return Response(response_data)
+
+        # Return paginated response if pagination is enabled
+        if page is not None:
+            return self.get_paginated_response(response_data)
+
+        return Response(response_data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['POST'])
     def add_subnode(self, request, id=None):
@@ -122,63 +162,57 @@ class NodeFamilyViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['POST'])
     def clone(self, request, id=None):
-        """Clone an entire node family with all versions"""
+        """Clone an entire NodeFamily with all versions and subnode links."""
         family = self.get_object()
         new_name = request.data.get('new_name')
-
         if not new_name:
-            return Response(
-                {"error": "new_name is required"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": "new_name is required"}, status=400)
 
         with transaction.atomic():
-            try:
-                new_family = NodeFamily.objects.create(
-                    name=new_name,
-                    description=family.description,
+            # Create new family
+            new_family = NodeFamily.objects.create(
+                name=new_name,
+                description=family.description,
+                created_by=request.user.username
+            )
+
+            # Map old version ID -> new version
+            version_map = {}
+
+            # Clone versions
+            for version in family.versions.all():
+                new_version = NodeVersion.objects.create(
+                    family=new_family,
+                    version=version.version,
+                    state=version.state,
+                    script=version.script,
+                    changelog=f"Cloned from {family.name} v{version.version}",
                     created_by=request.user.username
                 )
+                version_map[version.id] = new_version
 
-                # Clone all versions
-                for version in family.versions.all():
-                    new_version = NodeVersion.objects.create(
-                        family=new_family,
-                        version=version.version,
-                        state=version.state,
-                        script=version.script,
-                        changelog=f"Cloned from {family.name} v{version.version}",
-                        created_by=request.user.username
-                    )
-                    # Clone parameters
-                    NodeParameter.objects.bulk_create([
-                        NodeParameter(
-                            node_version=new_version,
-                            parameter=np.parameter,
-                            value=np.value
-                        )
-                        for np in version.nodeparameter_set.all()
-                    ])
-                    # Clone subnode links
-                    NodeVersionLink.objects.bulk_create([
-                        NodeVersionLink(
+                # Clone parameters
+                NodeParameter.objects.bulk_create([
+                    NodeParameter(node_version=new_version, parameter=p.parameter, value=p.value)
+                    for p in version.parameters.all()
+                ])
+
+            # Clone child links safely
+            for old_version in family.versions.all():
+                new_version = version_map[old_version.id]
+                for link in old_version.child_links.all():
+                    child_old_id = link.child_version.id
+                    # Only clone if child version exists in new family
+                    if child_old_id in version_map:
+                        child_new_version = version_map[child_old_id]
+                        NodeVersionLink.objects.get_or_create(
                             parent_version=new_version,
-                            child_version=link.child_version,
-                            order=link.order
+                            child_version=child_new_version,
+                            defaults={'order': link.order}
                         )
-                        for link in version.child_links.all()
-                    ])
 
-                return Response(
-                    NodeFamilySerializer(new_family, context={'request': request}).data,
-                    status=status.HTTP_201_CREATED
-                )
-            except Exception as e:
-                logger.error(f"Error cloning family: {str(e)}")
-                return Response(
-                    {"error": "Failed to clone family"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
+        serializer = NodeFamilySerializer(new_family, context={'request': request})
+        return Response(serializer.data, status=201)
 
     @action(detail=False, methods=['POST'])
     def import_family(self, request):
@@ -241,12 +275,11 @@ class NodeFamilyViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(family)
         return Response(serializer.data)
 
-
 class VersionViewSet(viewsets.GenericViewSet,
-                   mixins.ListModelMixin,
-                   mixins.RetrieveModelMixin,
-                   mixins.DestroyModelMixin,
-                   mixins.CreateModelMixin):
+                     mixins.ListModelMixin,
+                     mixins.RetrieveModelMixin,
+                     mixins.DestroyModelMixin,
+                     mixins.CreateModelMixin):
     """
     ViewSet for NodeVersion operations within a family
     """
@@ -284,7 +317,7 @@ class VersionViewSet(viewsets.GenericViewSet,
         if self.action == 'create':
             return NodeVersionCreateSerializer
         return super().get_serializer_class()
-    
+
     def create(self, request, family_id=None):
         """Create a new version in the family"""
         family = get_object_or_404(NodeFamily, id=family_id)
@@ -292,36 +325,8 @@ class VersionViewSet(viewsets.GenericViewSet,
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
-            version_count = family.versions.count()
-            max_version = family.versions.aggregate(Max('version'))['version__max'] or 0
-
-            # If no versions exist for the family, allow creating the initial version (v1)
-            if version_count == 0:
-                new_version = NodeVersion.objects.create(
-                    family=family,
-                    version=1,
-                    state='draft',
-                    changelog=serializer.validated_data.get('changelog', ''),
-                    created_by=request.user.username
-                )
-                # No source to copy from (initial creation)
-                return Response(
-                    NodeVersionSerializer(new_version, context={'request': request}).data,
-                    status=status.HTTP_201_CREATED
-                )
-
-            # For families with existing versions, require an active published version
-            active_version = family.versions.filter(state='published').order_by('-version').first()
-            source_version_num = serializer.validated_data.get('source_version')
-
-            # If no active published version and no explicit source provided -> error
-            if not active_version and source_version_num is None:
-                return Response(
-                    {"error": "Cannot create a new version when there is no active (published) version for this family."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
             # Create new version number
+            max_version = family.versions.aggregate(Max('version'))['version__max'] or 0
             new_version = NodeVersion.objects.create(
                 family=family,
                 version=max_version + 1,
@@ -330,46 +335,31 @@ class VersionViewSet(viewsets.GenericViewSet,
                 created_by=request.user.username
             )
 
-            # Choose source: explicit source_version if provided, else active published version
-            chosen_source_num = source_version_num or (active_version.version if active_version else None)
-            if chosen_source_num is not None:
-                source = get_object_or_404(
-                    NodeVersion,
-                    family=family,
-                    version=chosen_source_num
-                )
-                # Copy script from source
+            # Copy from source version if provided
+            source_version_num = serializer.validated_data.get('source_version')
+            if source_version_num:
+                source = get_object_or_404(NodeVersion, family=family, version=source_version_num)
                 new_version.script = source.script
                 new_version.save()
-                # Copy parameters in bulk from the chosen source
+
+                # Copy parameters
                 NodeParameter.objects.bulk_create([
-                    NodeParameter(
-                        node_version=new_version,
-                        parameter=np.parameter,
-                        value=np.value
-                    )
-                    for np in source.parameters.select_related('parameter').all()
+                    NodeParameter(node_version=new_version, parameter=p.parameter, value=p.value)
+                    for p in source.parameters.all()
                 ])
-                # Copy subnode links in bulk from the chosen source, deduplicate to avoid UNIQUE constraint
-                seen_child_ids = set()
-                link_objs = []
+
+                # Copy child links safely
                 for link in source.child_links.all():
-                    child_id = getattr(link.child_version, 'id', None) or link.child_version_id
-                    if child_id in seen_child_ids:
-                        continue
-                    seen_child_ids.add(child_id)
-                    link_objs.append(NodeVersionLink(
+                    NodeVersionLink.objects.get_or_create(
                         parent_version=new_version,
                         child_version=link.child_version,
-                        order=link.order
-                    ))
-                if link_objs:
-                    NodeVersionLink.objects.bulk_create(link_objs, ignore_conflicts=True)
+                        defaults={'order': link.order}
+                    )
 
-            return Response(
-                NodeVersionSerializer(new_version, context={'request': request}).data,
-                status=status.HTTP_201_CREATED
-            )
+        return Response(
+            NodeVersionSerializer(new_version, context={'request': request}).data,
+            status=status.HTTP_201_CREATED
+        )
 
     @action(detail=True, methods=['POST'])
     def link_subversion(self, request, family_id=None, version=None):
@@ -377,184 +367,65 @@ class VersionViewSet(viewsets.GenericViewSet,
         version_obj = self.get_object()
         subversion_id = request.data.get('subversion_id')
         order = request.data.get('order', 0)
-        
+
         if not subversion_id:
-            return Response(
-                {"error": "subversion_id is required"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            subversion = NodeVersion.objects.get(id=subversion_id)
-            if subversion.family == version_obj.family:
-                raise ValidationError("Cannot link versions from the same family")
-        except NodeVersion.DoesNotExist:
-            return Response(
-                {"error": "Subversion not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
+            return Response({"error": "subversion_id is required"}, status=400)
+
+        subversion = get_object_or_404(NodeVersion, id=subversion_id)
+
+        if subversion.family == version_obj.family:
+            return Response({"error": "Cannot link versions from the same family"}, status=400)
         if not version_obj.family.child_nodes.filter(id=subversion.family.id).exists():
-            return Response(
-                {"error": "Can only link versions from configured subnodes"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        with transaction.atomic():
-            NodeVersionLink.objects.create(
-                parent_version=version_obj,
-                child_version=subversion,
-                order=order
-            )
-            return Response(status=status.HTTP_204_NO_CONTENT)
+            return Response({"error": "Can only link versions from configured subnodes"}, status=400)
+
+        NodeVersionLink.objects.get_or_create(
+            parent_version=version_obj,
+            child_version=subversion,
+            defaults={'order': order}
+        )
+        return Response(status=204)
 
     @action(detail=True, methods=['POST'])
     def publish(self, request, family_id=None, version=None):
         """Publish this version and archive others"""
         version_obj = self.get_object()
-        
         if version_obj.state == 'published':
-            return Response(
-                {"status": "Version is already published"},
-                status=status.HTTP_200_OK
-            )
-        
+            return Response({"status": "Already published"}, status=200)
         if not version_obj.script:
-            return Response(
-                {"error": "Cannot publish version without a script"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
+            return Response({"error": "Cannot publish version without a script"}, status=400)
+
         with transaction.atomic():
-            # Archive other published versions
-            NodeVersion.objects.filter(
-                family_id=family_id,
-                state='published'
-            ).update(state='archived')
-            
+            NodeVersion.objects.filter(family_id=family_id, state='published').update(state='archived')
             version_obj.state = 'published'
             version_obj.save()
-            
             version_obj.family.is_deployed = True
             version_obj.family.save()
-            
-            return Response(
-                {"status": f"Version {version_obj.version} published successfully"},
-                status=status.HTTP_200_OK
-            )
+        return Response({"status": f"Version {version_obj.version} published successfully"}, status=200)
 
     @action(detail=True, methods=['POST'])
     def rollback(self, request, family_id=None, version=None):
         """Rollback to a previous version"""
-        target_version = get_object_or_404(
-            NodeVersion.objects.filter(state__in=['published', 'archived']),
-            family_id=family_id,
-            version=version
-        )
-
+        target_version = get_object_or_404(NodeVersion.objects.filter(state__in=['published', 'archived']),
+                                           family_id=family_id, version=version)
         with transaction.atomic():
-            NodeVersion.objects.filter(
-                family_id=family_id,
-                state='published'
-            ).update(state='archived')
-
+            NodeVersion.objects.filter(family_id=family_id, state='published').update(state='archived')
             target_version.state = 'published'
-            target_version.changelog = (
-                f"Reactivated via rollback from v{self.get_active_version(family_id)}"
-            )
             target_version.save()
-
             target_version.family.is_deployed = True
             target_version.family.save()
-
-        return Response(
-            NodeVersionSerializer(target_version, context={'request': request}).data,
-            status=status.HTTP_200_OK
-        )
+        return Response(NodeVersionSerializer(target_version, context={'request': request}).data, status=200)
 
     def destroy(self, request, *args, **kwargs):
         """Delete a version if it's not published and not the only version"""
         version_obj = self.get_object()
-        
         if version_obj.state == 'published':
-            return Response(
-                {"error": "Cannot delete published versions"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-            
+            return Response({"error": "Cannot delete published versions"}, status=400)
         if version_obj.family.versions.count() == 1:
-            return Response(
-                {"error": "Cannot delete the only version in family"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-            
+            return Response({"error": "Cannot delete the only version in family"}, status=400)
         version_obj.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(status=204)
 
-class ExecutionViewSet(viewsets.GenericViewSet):
-    """
-    ViewSet for NodeExecution operations
-    """
-    queryset = NodeExecution.objects.all()
-    serializer_class = NodeExecutionSerializer
-    permission_classes = [permissions.AllowAny]
 
-    def get_queryset(self):
-        return super().get_queryset().select_related(
-            'version__family'
-        ).order_by('-started_at')
-
-    @action(detail=True, methods=['POST'])
-    def execute(self, request, family_id=None, version=None):
-        """Execute a published version"""
-        version_obj = get_object_or_404(
-            NodeVersion, 
-            family_id=family_id, 
-            version=version
-        )
-
-        if version_obj.state != 'published':
-            return Response(
-                {"error": "Only published versions can be executed"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        execution = NodeExecution.objects.create(
-            version=version_obj,
-            status='queued',
-            triggered_by=request.user.username,
-            log=f"Execution queued by {request.user.username}"
-        )
-
-        return Response(
-            NodeExecutionSerializer(execution, context={'request': request}).data,
-            status=status.HTTP_202_ACCEPTED
-        )
-
-    @action(detail=True, methods=['POST'], url_path='stop')
-    def stop_execution(self, request, family_id=None, execution_id=None):
-        """Stop a running execution"""
-        execution = get_object_or_404(
-            NodeExecution, 
-            version__family_id=family_id, 
-            id=execution_id
-        )
-
-        if execution.status != 'running':
-            return Response(
-                {"error": "Only running executions can be stopped"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        execution.status = 'stopped'
-        execution.completed_at = timezone.now()
-        execution.log += "\nManually stopped by user"
-        execution.save()
-
-        return Response(
-            {"status": "Execution stopped"}, 
-            status=status.HTTP_200_OK
-        )
 class VersionContentViewSet(viewsets.GenericViewSet):
     """
     ViewSet for version content management (scripts, parameters)
@@ -742,7 +613,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                 {"error": "Internal server error while adding parameters"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )  
-   
+
     @action(detail=True, methods=['POST'], url_path='remove_parameter')
     def remove_parameter(self, request, family_id=None, version=None):
         """Remove parameters from this version"""
@@ -761,12 +632,21 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Convert string IDs to UUID objects
+        try:
+            param_ids = [UUID(pid) for pid in param_ids]
+        except ValueError as e:
+            return Response(
+                {"error": f"Invalid UUID in parameter_ids: {e}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         with transaction.atomic():
             # Validate parameters exist before deletion
             existing_params = node_version.parameters.filter(
                 parameter_id__in=param_ids
             ).values_list('parameter_id', flat=True)
-            
+
             missing_params = set(param_ids) - set(existing_params)
             if missing_params:
                 return Response(
@@ -788,7 +668,7 @@ class VersionContentViewSet(viewsets.GenericViewSet):
                 },
                 status=status.HTTP_200_OK
             )
-    
+
     @action(detail=True, methods=['GET'])
     def subnodes(self, request, family_id=None, version=None):
         """Get all subnodes with their parameters for this version"""
@@ -907,6 +787,10 @@ class VersionContentViewSet(viewsets.GenericViewSet):
             "errors": errors,
             "version_data": NodeVersionSerializer(node_version, context={'request': request}).data
         }, status=status.HTTP_200_OK)
+
+
+
+
 class DeploymentViewSet(viewsets.GenericViewSet):
     """
     ViewSet for handling version deployment operations
@@ -1059,3 +943,210 @@ class DeploymentViewSet(viewsets.GenericViewSet):
     def add_paramtery(self, request, family_id=None, version=None):
         """Alias for add_parameter to accept common misspelling of the URL."""
         return self.add_parameter(request, family_id=family_id, version=version)
+
+
+
+
+from rest_framework import viewsets, status, permissions
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.shortcuts import get_object_or_404
+from channels.db import database_sync_to_async
+from asgiref.sync import async_to_sync
+
+from .models import NodeExecution, NodeVersion
+from .serializers import NodeExecutionSerializer
+from .node_runner import NodeRunner
+from .websocket_logger import broadcaster
+
+
+class ExecutionViewSet(viewsets.GenericViewSet):
+    """ViewSet for NodeExecution operations"""
+    queryset = NodeExecution.objects.all()
+    serializer_class = NodeExecutionSerializer
+   
+
+    def get_queryset(self):
+        return super().get_queryset().select_related(
+            'version__family'
+        ).order_by('-started_at')
+
+    @action(detail=False, methods=['POST'], url_path='start')
+    def start_execution(self, request):
+        """
+        Start a new node execution
+        """
+        family_id = request.data.get("family_id")
+        version = request.data.get("version")
+        subnode_id = request.data.get("subnode_id")
+        parameters = request.data.get("parameters", {})
+
+        if not all([family_id, version]):
+            return Response(
+                {"error": "family_id and version are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Regular sync database operation
+        try:
+            version_obj = NodeVersion.objects.get(family_id=family_id, version=version)
+        except NodeVersion.DoesNotExist:
+            return Response(
+                {"error": "Version not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if version_obj.state != 'published':
+            return Response(
+                {"error": "Only published versions can be executed"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        triggered_by = request.user.username
+
+        try:
+            # Run the async execution function using async_to_sync
+            execution = async_to_sync(NodeRunner.run_standalone_async)(
+                node_version_id=version_obj.id,
+                subnode_id=subnode_id,
+                params=parameters,
+                triggered_by=triggered_by
+            )
+
+            serializer = NodeExecutionSerializer(execution, context={'request': request})
+            return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+        except Exception as e:
+            return Response(
+                {"error": f"Failed to start execution: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=True, methods=['POST'], url_path='stop')
+    def stop_execution(self, request, pk=None):
+        """
+        Stop a running execution
+        """
+        execution = get_object_or_404(NodeExecution, id=pk)
+
+        if execution.status != 'running':
+            return Response(
+                {"error": "Only running executions can be stopped"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        execution.status = 'stopped'
+        execution.completed_at = timezone_now()
+        execution.log += f"\n[{timezone_now().isoformat()}] Manually stopped by {request.user.username}"
+        execution.save()
+
+        return Response(
+            {"status": "Execution stopped", "execution_id": str(execution.id)},
+            status=status.HTTP_200_OK
+        )
+
+    @action(detail=True, methods=['GET'], url_path='status')
+    def execution_status(self, request, pk=None):
+        """Get execution status and logs"""
+        execution = get_object_or_404(NodeExecution, id=pk)
+        serializer = NodeExecutionSerializer(execution, context={'request': request})
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['GET'], url_path='logs')
+    def execution_logs(self, request, pk=None):
+        """Get execution logs"""
+        execution = get_object_or_404(NodeExecution, id=pk)
+        return Response({
+            "execution_id": str(execution.id),
+            "logs": execution.log,
+            "status": execution.status
+        })
+
+    def list(self, request):
+        queryset = self.get_queryset()
+        serializer = NodeExecutionSerializer(queryset, many=True, context={'request': request})
+        return Response(serializer.data)
+
+    def retrieve(self, request, pk=None):
+        execution = get_object_or_404(NodeExecution, id=pk)
+        serializer = NodeExecutionSerializer(execution, context={'request': request})
+        return Response(serializer.data)
+class NodeTestViewSet(viewsets.ViewSet):
+    """
+    Test ViewSet to execute NodeVersion scripts with optional SubNode overrides.
+    """
+
+    @action(detail=False, methods=['post'], url_path='execute-node')
+    def execute_node(self, request):
+        """
+        Execute a NodeVersion script for a specific NodeFamily and SubNode.
+        """
+        family_id = request.data.get("family_id")
+        version_id = request.data.get("version_id")
+        subnode_id = request.data.get("subnode_id")
+
+        if not all([family_id, version_id, subnode_id]):
+            return Response(
+                {"error": "family_id, version_id, and subnode_id are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        node_version = get_object_or_404(NodeVersion, id=version_id, family_id=family_id)
+        subnode = get_object_or_404(SubNode, id=subnode_id, node_family_id=family_id)
+
+        triggered_by = request.user.username if request.user.is_authenticated else "anonymous"
+
+        execution = NodeExecution.objects.create(
+            version=node_version,
+            status="queued",
+            triggered_by=triggered_by,
+            log=f"Execution queued by {triggered_by}"
+        )
+
+        channel_layer = get_channel_layer()
+        group_name = f"node_exec_{execution.id}"
+
+        def log_callback(message):
+            timestamped = f"[{timezone_now().isoformat()}] {message}"
+            execution.log += f"{timestamped}\n"
+            execution.save()
+            async_to_sync(channel_layer.group_send)(
+                group_name,
+                {"type": "node.log", "message": message}
+            )
+
+        # Merge parameters
+        node_params = {p.parameter.key: p.value for p in node_version.parameters.select_related('parameter').all()}
+        subnode_params = {sp.parameter.key: sp.value for sp in SubNodeParameterValue.objects.filter(subnode=subnode).select_related('parameter')}
+        exec_params = {**node_params, **subnode_params}
+
+        # Run asynchronously
+        def run_node():
+            try:
+                execution.status = "running"
+                execution.save()
+                NodeRunner.run_standalone(
+                    node_version_id=node_version.id,
+                    subnode_instance=subnode,
+                    params=exec_params,
+                    log_callback=log_callback,
+                    triggered_by=triggered_by
+                )
+            except Exception as e:
+                execution.status = "failed"
+                log_callback(f"Execution error: {str(e)}")
+                execution.completed_at = timezone_now()
+                execution.save()
+
+        threading.Thread(target=run_node, daemon=True).start()
+
+        serializer = NodeExecutionSerializer(execution)
+        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=['get'], url_path='logs')
+    def get_logs(self, request, pk=None):
+        """Retrieve execution logs for a NodeExecution"""
+        execution = get_object_or_404(NodeExecution, pk=pk)
+        return Response({"log": execution.log})
+
+

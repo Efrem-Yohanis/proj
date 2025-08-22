@@ -25,12 +25,9 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    
-    # Third-party apps
+    'channels',
     'corsheaders',
     'rest_framework',
-    
-    # Local apps
     'flow_builder_app',
 ]
 
@@ -63,12 +60,18 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'backend_api.wsgi.application'
-
+ASGI_APPLICATION = 'flow_builder_app.routing.application'
 # Database
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer'  # for development/testing
     }
 }
 

@@ -12,7 +12,7 @@ from flow_builder_app.node.models import (
 )
 from flow_builder_app.parameter.models import Parameter,ParameterValue
 from flow_builder_app.subnode.serializers import SubNodeVersionSerializer
-from flow_builder_app.subnode.models import SubNode
+from flow_builder_app.subnode.models import SubNode, SubNodeParameterValue
 
 
 class NodeVersionSerializer(serializers.ModelSerializer):
@@ -58,34 +58,54 @@ class NodeVersionSerializer(serializers.ModelSerializer):
         return None
 
     def get_subnodes(self, obj):
-        # Get linked subnodes from NodeVersionLink
-        links = obj.child_links.select_related('child_version__family').all()
+        """Subnodes with active version parameters - replicate family endpoint logic"""
+        links = obj.child_links.select_related("child_version__family").all()
         result = []
-        subnodes = SubNode.objects.filter(node_family=obj.family)
+        processed_subnodes = set()
+        
         for link in links:
-            child_version = link.child_version
-            result.append({
-                "link_id": str(link.id),
-                "order": link.order,
-                "family": {
-                    "id": str(child_version.family.id),
-                    "name": child_version.family.name,
-                    "is_deployed": child_version.family.is_deployed
-                },
-                "version": {
-                    "id": str(child_version.id),
-                    "version": child_version.version,
-                    "state": child_version.state,
-                    "parameters": [
-                        {
-                            "key": np.parameter.key,
-                            "value": np.value,
-                            "datatype": getattr(np.parameter, 'datatype', None)
-                        }
-                        for np in child_version.parameters.select_related('parameter').all()
-                    ]
-                }
-            })
+            child_family = link.child_version.family
+            
+            # Get ALL subnodes for this family (not just active ones)
+            subnodes = SubNode.objects.filter(node_family=child_family)
+            
+            # Create a mapping of subnode name to active version
+            active_subnodes_map = {}
+            for subnode in subnodes:
+                if subnode.is_deployed:
+                    active_subnodes_map[subnode.name] = subnode
+            
+            for name, active_subnode in active_subnodes_map.items():
+                # Skip if we already processed this subnode
+                if str(active_subnode.id) in processed_subnodes:
+                    continue
+                    
+                processed_subnodes.add(str(active_subnode.id))
+                
+                # Use the same logic as the family endpoint
+                param_values = {}
+                
+                # Get all ParameterValue objects for this active subnode
+                param_values_queryset = SubNodeParameterValue.objects.filter(
+                    subnode=active_subnode
+                ).select_related('parameter')
+                
+                # Create a dictionary of parameter key -> value
+                for pv in param_values_queryset:
+                    param_values[pv.parameter.key] = pv.value
+                
+                # Also include parameters from the node version that might not have subnode-specific values
+                for np in obj.parameters.select_related('parameter').all():
+                    if np.parameter.key not in param_values:
+                        param_values[np.parameter.key] = np.value or np.parameter.default_value
+                
+                result.append({
+                    "id": str(active_subnode.id),
+                    "name": active_subnode.name,
+                    "active_version": active_subnode.version,
+                    "parameter_values": param_values
+                })
+        
         return result
 
 class NodeFamilySerializer(serializers.ModelSerializer):
@@ -106,17 +126,73 @@ class NodeFamilySerializer(serializers.ModelSerializer):
                 "created_by", "is_deployed", "published_version", "versions"
             ]
 
+    # def get_versions(self, obj):
+    #     """
+    #     For each node version, return parameters and for each subnode the value
+    #     taken from NodeParameter (version-level). Falls back to Parameter.default_value.
+    #     """
+    #     node_versions = NodeVersion.objects.filter(family=obj).order_by("version")
+
+    #     # fetch subnodes once
+    #     subnodes = list(SubNode.objects.filter(node_family=obj))
+
+    #     results = []
+    #     for nv in node_versions:
+    #         # NodeParameter objects for this version
+    #         node_params = NodeParameter.objects.filter(node_version=nv).select_related('parameter')
+
+    #         # parameters list for response
+    #         params = [
+    #             {
+    #                 "id": str(np.parameter.id),
+    #                 "key": np.parameter.key,
+    #                 "datatype": np.parameter.datatype,
+    #                 "default_value": np.parameter.default_value
+    #             }
+    #             for np in node_params
+    #         ]
+
+    #         # build map parameter_id -> value for this version
+    #         param_value_map = { str(np.parameter.id): np.value for np in node_params }
+
+    #         # For each subnode, apply the version-level value
+    #         subnodes_list = []
+    #         for sn in subnodes:
+    #             param_values = {}
+    #             for np in node_params:
+    #                 pid = str(np.parameter.id)
+    #                 value = param_value_map.get(pid)
+    #                 if value is None:
+    #                     value = np.parameter.default_value
+    #                 param_values[np.parameter.key] = value
+
+    #             subnodes_list.append({
+    #                 "id": str(sn.id),
+    #                 "name": sn.name,
+    #                 "parameter_values": param_values
+    #             })
+
+    #         results.append({
+    #             "version": nv.version,
+    #             "parameters": params,
+    #             "subnodes": subnodes_list
+    #         })
+    #     return results
+
     def get_versions(self, obj):
-        """
-        For each node version, return parameters and for each subnode the value
-        taken from NodeParameter (version-level). Falls back to Parameter.default_value.
-        """
+        """For each node version, return parameters and subnodes with ACTIVE versions"""
         node_versions = NodeVersion.objects.filter(family=obj).order_by("version")
-
-        # fetch subnodes once
-        subnodes = list(SubNode.objects.filter(node_family=obj))
-
         results = []
+        
+        # Get all subnodes for this family once
+        all_subnodes = SubNode.objects.filter(node_family=obj)
+        
+        # Create a mapping of subnode name to active version
+        active_subnodes_map = {}
+        for subnode in all_subnodes:
+            if subnode.is_deployed:
+                active_subnodes_map[subnode.name] = subnode
+        
         for nv in node_versions:
             # NodeParameter objects for this version
             node_params = NodeParameter.objects.filter(node_version=nv).select_related('parameter')
@@ -132,34 +208,40 @@ class NodeFamilySerializer(serializers.ModelSerializer):
                 for np in node_params
             ]
 
-            # build map parameter_id -> value for this version
-            param_value_map = { str(np.parameter.id): np.value for np in node_params }
-
-            # For each subnode, apply the version-level value
+            # For each active subnode, get parameters
             subnodes_list = []
-            for sn in subnodes:
+            
+            for name, active_subnode in active_subnodes_map.items():
+                # Get parameters for the active version using the correct method
                 param_values = {}
+                
+                # Get all ParameterValue objects for this active subnode
+                param_values_queryset = SubNodeParameterValue.objects.filter(
+                    subnode=active_subnode
+                ).select_related('parameter')
+                
+                # Create a dictionary of parameter key -> value
+                for pv in param_values_queryset:
+                    param_values[pv.parameter.key] = pv.value
+                
+                # Also include parameters from the node version that might not have subnode-specific values
                 for np in node_params:
-                    pid = str(np.parameter.id)
-                    value = param_value_map.get(pid)
-                    if value is None:
-                        value = np.parameter.default_value
-                    param_values[np.parameter.key] = value
-
+                    if np.parameter.key not in param_values:
+                        param_values[np.parameter.key] = np.value or np.parameter.default_value
+                
                 subnodes_list.append({
-                    "id": str(sn.id),
-                    "name": sn.name,
+                    "id": str(active_subnode.id),
+                    "name": active_subnode.name,
+                    "active_version": active_subnode.version,
                     "parameter_values": param_values
                 })
-
+            
             results.append({
                 "version": nv.version,
                 "parameters": params,
                 "subnodes": subnodes_list
             })
         return results
-
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if self.context.get('request') and self.context['request'].method == 'GET':
@@ -189,6 +271,13 @@ class NodeFamilySerializer(serializers.ModelSerializer):
 
     def get_subnodes_count(self, obj: NodeFamily) -> int:
         return obj.subnodes.count()
+    
+    def get_published_version(self, obj):
+        """Get the latest published version only"""
+        published = obj.versions.filter(state="published").order_by("-version").first()
+        if published:
+            return NodeVersionSerializer(published, context=self.context).data
+        return None
 
     def get_subnodes(self, obj):
         """Get basic subnode information at family level"""
@@ -487,3 +576,9 @@ class NodeFamilyVersionSerializer(serializers.Serializer):
     version = serializers.IntegerField()
     parameters = serializers.ListField()
     subnodes = serializers.ListField()
+
+
+class NodeExecutionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NodeExecution
+        fields = '__all__'
